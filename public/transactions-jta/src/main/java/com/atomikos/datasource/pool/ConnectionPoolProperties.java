@@ -105,7 +105,7 @@ public interface ConnectionPoolProperties
 	 * @return True if pooling is disabled, false otherwise. Defaults to false.
 	 */
 	public default boolean getDisablePooling() {
-        return false;
-    }
+		return false;
+	}
 
 }

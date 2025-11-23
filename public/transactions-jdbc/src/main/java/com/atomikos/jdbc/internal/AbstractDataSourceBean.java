@@ -281,6 +281,9 @@ implements DataSource, ConnectionPoolProperties, Referenceable, Serializable, Or
 	public synchronized void init() throws AtomikosSQLException 
 	{
 		if ( LOGGER.isDebugEnabled() ) LOGGER.logInfo ( this + ": init..." );
+		// Return early if already initialized:
+		// - connectionPool exists for pooled mode, or
+		// - connectionFactory exists for unpooled mode
 		if (connectionPool != null || (disablePooling && connectionFactory != null))
 			return;
 		
