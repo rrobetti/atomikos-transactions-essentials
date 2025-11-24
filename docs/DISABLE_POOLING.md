@@ -17,6 +17,7 @@ You might want to disable connection pooling in the following scenarios:
 3. **Resource Constraints**: When you want to minimize the number of persistent connections to the database
 4. **Debugging**: When troubleshooting connection-related issues and want to eliminate pooling as a variable
 5. **Cloud Environments**: In serverless or ephemeral environments where maintaining a connection pool is counterproductive
+6. **Third party connection pooling**: In some situations you might want to delegate the connection pooling to a third party library like Oracle UCP for example.
 
 ### Configuration
 
