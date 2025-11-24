@@ -28,6 +28,7 @@ import com.atomikos.datasource.pool.ConnectionPoolWithConcurrentValidation;
 import com.atomikos.datasource.pool.ConnectionPoolWithSynchronizedValidation;
 import com.atomikos.datasource.pool.CreateConnectionException;
 import com.atomikos.datasource.pool.PoolExhaustedException;
+import com.atomikos.datasource.pool.XPooledConnection;
 import com.atomikos.icatch.OrderedLifecycleComponent;
 import com.atomikos.logging.Logger;
 import com.atomikos.logging.LoggerFactory;
@@ -58,11 +59,13 @@ implements DataSource, ConnectionPoolProperties, Referenceable, Serializable, Or
 	private transient ConnectionPool<Connection> connectionPool;
 	private transient PrintWriter logWriter;
 	private String resourceName;
+	private transient ConnectionFactory<Connection> connectionFactory;
 
 	private int defaultIsolationLevel = DEFAULT_ISOLATION_LEVEL_UNSET;
 	private int maxLifetime = DEFAULT_MAX_LIFETIME;
 
 	private boolean enableConcurrentConnectionValidation = true;
+	private boolean disablePooling = false;
 	
 	protected void throwAtomikosSQLException ( String msg ) throws AtomikosSQLException 
 	{
@@ -227,12 +230,35 @@ implements DataSource, ConnectionPoolProperties, Referenceable, Serializable, Or
 	public boolean getConcurrentConnectionValidation() {
 		return enableConcurrentConnectionValidation;
 	}
+	
+	/**
+	 * Sets whether or not to disable connection pooling.
+	 * When true, each getConnection() call creates a new physical connection
+	 * that is closed immediately after the transaction completes.
+	 * Optional, defaults to false.
+	 * 
+	 * @param value True to disable pooling, false to enable pooling.
+	 */
+	public void setDisablePooling(boolean value) {
+		this.disablePooling = value;
+	}
+	
+	/**
+	 * Tests whether connection pooling is disabled or not.
+	 * 
+	 * @return True if pooling is disabled, false otherwise.
+	 */
+	public boolean getDisablePooling() {
+		return disablePooling;
+	}
 
 	public int poolAvailableSize() {
+		if (connectionPool == null) return 0;
 		return connectionPool.availableSize();
 	}
 
 	public int poolTotalSize() {
+		if (connectionPool == null) return 0;
 		return connectionPool.totalSize();
 	}
 
@@ -255,8 +281,26 @@ implements DataSource, ConnectionPoolProperties, Referenceable, Serializable, Or
 	public synchronized void init() throws AtomikosSQLException 
 	{
 		if ( LOGGER.isDebugEnabled() ) LOGGER.logInfo ( this + ": init..." );
-		if (connectionPool != null)
+		// Return early if already initialized:
+		// - connectionPool exists for pooled mode, or
+		// - connectionFactory exists for unpooled mode
+		if (connectionPool != null || (disablePooling && connectionFactory != null))
 			return;
+		
+		// If pooling is disabled, we don't need to initialize the pool
+		if (disablePooling) {
+			if ( LOGGER.isDebugEnabled() ) LOGGER.logInfo ( this + ": pooling disabled - skipping pool initialization" );
+			if ( getUniqueResourceName() == null )
+				throwAtomikosSQLException("Property 'uniqueResourceName' cannot be null");
+			try {
+				connectionFactory = doInit(); // Store factory for creating connections on demand
+			} catch ( Exception ex) { 
+				String msg =  "Cannot initialize datasource";
+				AtomikosSQLException.throwAtomikosSQLException ( msg , ex );
+			}
+			return;
+		}
+		
 		if ( maxPoolSize < 1 )
 			throwAtomikosSQLException ( "Property 'maxPoolSize' must be greater than 0, was: " + maxPoolSize );
 		if ( minPoolSize < 0 || minPoolSize > maxPoolSize )
@@ -298,6 +342,7 @@ implements DataSource, ConnectionPoolProperties, Referenceable, Serializable, Or
 			connectionPool.destroy();
 		}
 		connectionPool = null;
+		connectionFactory = null;
 		doClose();
 		try {
 			IntraVmObjectRegistry.removeResource ( getUniqueResourceName() );
@@ -321,15 +366,27 @@ implements DataSource, ConnectionPoolProperties, Referenceable, Serializable, Or
 		
 		init();
 		
-		try {
-			connection = connectionPool.borrowConnection();
-			
-		} catch (CreateConnectionException ex) {
-			throwAtomikosSQLException("Failed to create a connection", ex);
-		} catch (PoolExhaustedException e) {
-			throwAtomikosSQLException ("Connection pool exhausted - try increasing 'maxPoolSize' and/or 'borrowConnectionTimeout' on the DataSourceBean.");
-		} catch (ConnectionPoolException e) {
-			throwAtomikosSQLException("Error borrowing connection", e );
+		if (disablePooling) {
+			// When pooling is disabled, create a fresh connection directly
+			if ( LOGGER.isTraceEnabled() ) LOGGER.logTrace ( this + ": pooling disabled - creating unpooled connection" );
+			try {
+				XPooledConnection<Connection> xpc = connectionFactory.createPooledConnection();
+				connection = xpc.createConnectionProxy();
+			} catch (CreateConnectionException ex) {
+				throwAtomikosSQLException("Failed to create a connection", ex);
+			}
+		} else {
+			// Normal pooled connection
+			try {
+				connection = connectionPool.borrowConnection();
+				
+			} catch (CreateConnectionException ex) {
+				throwAtomikosSQLException("Failed to create a connection", ex);
+			} catch (PoolExhaustedException e) {
+				throwAtomikosSQLException ("Connection pool exhausted - try increasing 'maxPoolSize' and/or 'borrowConnectionTimeout' on the DataSourceBean.");
+			} catch (ConnectionPoolException e) {
+				throwAtomikosSQLException("Error borrowing connection", e );
+			}
 		}
 		if ( LOGGER.isTraceEnabled() ) LOGGER.logTrace ( this + ": returning " + connection );
 		return connection;

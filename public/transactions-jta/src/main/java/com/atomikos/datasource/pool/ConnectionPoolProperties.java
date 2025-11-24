@@ -96,5 +96,16 @@ public interface ConnectionPoolProperties
 	 * @return The level, or -1 if not set.
 	 */
 	int getDefaultIsolationLevel();
+	
+	/**
+	 * Tests whether connection pooling should be disabled or not.
+	 * If true, then each getConnection() call will create a new physical connection
+	 * that is closed immediately after the transaction completes.
+	 * 
+	 * @return True if pooling is disabled, false otherwise. Defaults to false.
+	 */
+	public default boolean getDisablePooling() {
+		return false;
+	}
 
 }

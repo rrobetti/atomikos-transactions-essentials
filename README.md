@@ -22,7 +22,7 @@
 * **Light-weight**  - so your **microservices** can use it, too.
 * **Embeddable in your code** - so you can **test everything in the IDE** and avoid late integration issues at deployment time.
 * **OSGi support** - so you can use OSGi containers also.
-* **Connection pooling for JDBC and JMS** - so you get maximum **performance**.
+* **Connection pooling for JDBC and JMS** - so you get maximum **performance**. Pooling can also be disabled per datasource if needed (e.g., for testing, debugging, serverless environments, or third party pooling delegation).
 * **Built-in support for Hibernate and JPA** - so you can use your favorite persistence framework.
 * **Automatic crash / restart recovery** - so your incomplete **distributed transactions are cleaned up** and your data returns to a consistent state.
 * **Cloud-native design** - so your applications are ready for **deployment to your cloud**. 
@@ -60,6 +60,8 @@ See [Getting Started](http://www.atomikos.com/Documentation/GettingStarted) for 
 ### Documentation
 
 See documentation at [www.atomikos.com/Documentation](http://www.atomikos.com/Documentation/)
+
+For information about disabling connection pooling, see [docs/DISABLE_POOLING.md](docs/DISABLE_POOLING.md)
 
 ### Code Samples
 
