@@ -125,7 +125,9 @@ public synchronized void submitPropagationMessage(PropagationMessage msg) {
    return new TransactionServiceImp(tmUniqueName, recoveryManager, idMgr, 
        maxTimeout, maxActives, true, recoveryLog);
    //                             ^^^^
-   // HARDCODED to true, ignoring the property!
+   // HARDCODED to true, meaning single_threaded_2pc=true
+   // This ENABLES single-threaded mode (same thread for commit).
+   // The property com.atomikos.icatch.threaded_2pc is ignored!
    ```
 
 3. **TransactionServiceImp:** Passes the flag to `CoordinatorImp`
@@ -168,14 +170,18 @@ return new TransactionServiceImp(tmUniqueName, recoveryManager, idMgr,
 
 **Required Change:**
 ```java
+// Note: ConfigProperties.getAsBoolean() exists and is used for other boolean properties
+// The inversion (!...) is needed because threaded_2pc=true means multi-threaded,
+// but TransactionServiceImp expects single_threaded_2pc=true for single-threaded mode
 boolean singleThreaded2pc = !configProperties.getAsBoolean("com.atomikos.icatch.threaded_2pc");
 return new TransactionServiceImp(tmUniqueName, recoveryManager, idMgr, 
     maxTimeout, maxActives, singleThreaded2pc, recoveryLog);
 ```
 
-**Note:** The property `threaded_2pc` is inverted from `single_threaded_2pc`:
-- `threaded_2pc=true` → use separate threads → `single_threaded_2pc=false`
-- `threaded_2pc=false` → use same thread → `single_threaded_2pc=true`
+**Boolean Logic Explanation:**
+- `threaded_2pc=true` → use separate threads for 2PC → `single_threaded_2pc=false`
+- `threaded_2pc=false` → use same thread for 2PC → `single_threaded_2pc=true`
+- The `!` operator correctly converts the `threaded_2pc` property to the `single_threaded_2pc` parameter
 
 **Additional Change to ConfigProperties.java:**
 ```java
