@@ -39,6 +39,7 @@ public abstract class ConnectionPool<ConnectionType> implements XPooledConnectio
 	private PooledAlarmTimer maintenanceTimer;
 	private String name;
 	private ExecutorService dynamicallyGrowPoolExecutor = Executors.newFixedThreadPool(1);
+	private final boolean disablePooling;
 
 
 	public ConnectionPool ( ConnectionFactory<ConnectionType> connectionFactory , ConnectionPoolProperties properties ) throws ConnectionPoolException
@@ -47,6 +48,7 @@ public abstract class ConnectionPool<ConnectionType> implements XPooledConnectio
 		this.properties = properties;
 		this.destroyed = false;
 		this.name = properties.getUniqueResourceName();
+		this.disablePooling = properties.getDisablePooling();
 		init();
 	}
 
@@ -58,6 +60,11 @@ public abstract class ConnectionPool<ConnectionType> implements XPooledConnectio
 	private void init() throws ConnectionPoolException
 	{
 		if ( LOGGER.isTraceEnabled() ) LOGGER.logTrace ( this + ": initializing..." );
+		if (disablePooling) {
+			// When pooling is disabled, skip pre-allocation and maintenance
+			if ( LOGGER.isTraceEnabled() ) LOGGER.logTrace ( this + ": pooling disabled - minimal initialization" );
+			return;
+		}
 		addConnectionsIfMinPoolSizeNotReached();
 		launchMaintenanceTimer();
 	}
@@ -111,12 +118,31 @@ public abstract class ConnectionPool<ConnectionType> implements XPooledConnectio
 	public ConnectionType borrowConnection() throws CreateConnectionException, PoolExhaustedException,
 											 ConnectionPoolException {
 		assertNotDestroyed();
+		
+		if (disablePooling) {
+			// When pooling is disabled, always create a new connection
+			return createAndTrackUnpooledConnection();
+		}
+		
 		ConnectionType ret = null;	
 		ret = findExistingOpenConnectionForCallingThread();	
 		if (ret == null) {
 			ret = findOrWaitForAnAvailableConnection();		
 		}
 		return ret;
+	}
+	
+	/**
+	 * Creates a new connection when pooling is disabled and tracks it for cleanup.
+	 */
+	private ConnectionType createAndTrackUnpooledConnection() throws CreateConnectionException {
+		if ( LOGGER.isTraceEnabled() ) LOGGER.logTrace ( this + ": pooling disabled - creating new connection" );
+		XPooledConnection<ConnectionType> xpc = createPooledConnection();
+		xpc.registerXPooledConnectionEventListener(this);
+		synchronized (this) {
+			connections.add(xpc);
+		}
+		return xpc.createConnectionProxy();
 	}
 
 	private ConnectionType findOrWaitForAnAvailableConnection() throws ConnectionPoolException {
@@ -273,7 +299,10 @@ public abstract class ConnectionPool<ConnectionType> implements XPooledConnectio
 			}
 			connections = null;
 			destroyed = true;
-			maintenanceTimer.stopTimer();
+			// maintenanceTimer is null when disablePooling=true (init() skips launchMaintenanceTimer())
+			if (maintenanceTimer != null) {
+				maintenanceTimer.stopTimer();
+			}
 			dynamicallyGrowPoolExecutor.shutdownNow();
 			if ( LOGGER.isTraceEnabled() ) LOGGER.logTrace ( this + ": pool destroyed." );
 		}
@@ -348,6 +377,13 @@ public abstract class ConnectionPool<ConnectionType> implements XPooledConnectio
 	}
 
 	public synchronized void onXPooledConnectionTerminated(XPooledConnection<ConnectionType> connection) {
+		if (disablePooling) {
+			// When pooling is disabled, destroy the connection instead of returning to pool
+			if ( LOGGER.isTraceEnabled() ) LOGGER.logTrace( this +  ": pooling disabled - destroying connection " + connection);
+			destroyPooledConnection(connection);
+			connections.remove(connection);
+			return;
+		}
 		if ( LOGGER.isTraceEnabled() ) LOGGER.logTrace( this +  ": connection " + connection + " became available, notifying potentially waiting threads");
 		this.notify();
 

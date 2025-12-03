@@ -90,11 +90,12 @@ atomikos.datasource.disable-pooling=true
 
 When `disablePooling` is set to `true`:
 
-1. **No Pool Initialization**: The connection pool is not created during datasource initialization
+1. **Pool with Modified Behavior**: The connection pool infrastructure is still created, but with modified behavior for connection lifecycle management
 2. **Fresh Connections**: Each call to `getConnection()` creates a new physical connection to the database
-3. **Immediate Cleanup**: Connections are closed immediately when the application closes them or when the transaction completes
-4. **Ignored Pool Settings**: Pool-related properties (`minPoolSize`, `maxPoolSize`, `borrowConnectionTimeout`, `maxIdleTime`, etc.) are ignored
-5. **Connection Factory**: The underlying connection factory is still used to create connections, ensuring proper XA resource management
+3. **Explicit Cleanup**: Connections are explicitly closed and destroyed when the transaction completes (commit or rollback)
+4. **Ignored Pool Settings**: Pool-related properties (`minPoolSize`, `maxPoolSize`, `borrowConnectionTimeout`, `maxIdleTime`, etc.) are ignored - no connections are pre-allocated or maintained
+5. **Connection Tracking**: Active connections are tracked for proper cleanup during shutdown
+6. **Resource Cleanup**: The pool ensures all connections are properly closed when the datasource is closed
 
 ### Important Considerations
 
