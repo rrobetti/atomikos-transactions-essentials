@@ -33,9 +33,15 @@ public class ConnectionPoolWithSynchronizedValidation<ConnectionType> extends Co
 	}
 	
 	@Override
-	public synchronized ConnectionType borrowConnection() throws CreateConnectionException , PoolExhaustedException, ConnectionPoolException
+	public ConnectionType borrowConnection() throws CreateConnectionException , PoolExhaustedException, ConnectionPoolException
 	{
-		return super.borrowConnection();
+		// Use poolLock from parent instead of synchronized for virtual thread compatibility
+		poolLock.lock();
+		try {
+			return super.borrowConnection();
+		} finally {
+			poolLock.unlock();
+		}
 	}
 	
 	protected ConnectionType recycleConnectionIfPossible() throws Exception

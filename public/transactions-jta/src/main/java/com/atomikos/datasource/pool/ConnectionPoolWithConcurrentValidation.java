@@ -68,33 +68,48 @@ public class ConnectionPoolWithConcurrentValidation<ConnectionType> extends Conn
 		return ret;
 	}
 
-	private synchronized XPooledConnection<ConnectionType> claimFirstAvailablePooledConnection() {
-		XPooledConnection<ConnectionType> ret = null;
-		Iterator<XPooledConnection<ConnectionType>> it = connections.iterator();			
-		while ( it.hasNext() && ret == null ) {
-			XPooledConnection<ConnectionType> xpc =  it.next();
-			if (xpc.markAsBeingAcquiredIfAvailable()) {
-				ret = xpc;
+	private XPooledConnection<ConnectionType> claimFirstAvailablePooledConnection() {
+		poolLock.lock();
+		try {
+			XPooledConnection<ConnectionType> ret = null;
+			Iterator<XPooledConnection<ConnectionType>> it = connections.iterator();			
+			while ( it.hasNext() && ret == null ) {
+				XPooledConnection<ConnectionType> xpc =  it.next();
+				if (xpc.markAsBeingAcquiredIfAvailable()) {
+					ret = xpc;
+				}
 			}
+			return ret;
+		} finally {
+			poolLock.unlock();
 		}
-		return ret;
 	}
 	
-	private synchronized XPooledConnection<ConnectionType> findFirstRecyclablePooledConnectionForCallingThread() {
-		XPooledConnection<ConnectionType> ret = null;
-		Iterator<XPooledConnection<ConnectionType>> it = connections.iterator();			
-		while ( it.hasNext() && ret == null ) {
-			XPooledConnection<ConnectionType> xpc =  it.next();
-			if (xpc.canBeRecycledForCallingThread()) {
-				ret = xpc;
+	private XPooledConnection<ConnectionType> findFirstRecyclablePooledConnectionForCallingThread() {
+		poolLock.lock();
+		try {
+			XPooledConnection<ConnectionType> ret = null;
+			Iterator<XPooledConnection<ConnectionType>> it = connections.iterator();			
+			while ( it.hasNext() && ret == null ) {
+				XPooledConnection<ConnectionType> xpc =  it.next();
+				if (xpc.canBeRecycledForCallingThread()) {
+					ret = xpc;
+				}
 			}
+			return ret;
+		} finally {
+			poolLock.unlock();
 		}
-		return ret;
 	}
 	
-	private synchronized void removePooledConnection(XPooledConnection<ConnectionType> xpc) {
-		connections.remove(xpc);
-		destroyPooledConnection(xpc);
+	private void removePooledConnection(XPooledConnection<ConnectionType> xpc) {
+		poolLock.lock();
+		try {
+			connections.remove(xpc);
+			destroyPooledConnection(xpc);
+		} finally {
+			poolLock.unlock();
+		}
 	}
 
 }
