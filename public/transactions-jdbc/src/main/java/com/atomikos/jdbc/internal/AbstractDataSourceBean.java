@@ -76,47 +76,136 @@ implements DataSource, ConnectionPoolProperties, Referenceable, Serializable, Or
 
 	/**
 	 * Gets the minimum size of the pool. 
+	 * Returns configured value before init, current runtime value after init.
 	 */
 	public int getMinPoolSize() {
+		if (connectionPool != null) {
+			return connectionPool.getMinPoolSize();
+		}
 		return minPoolSize;
 	}
 
 	/**
 	 * Sets the minimum pool size. The amount of pooled connections won't go
 	 * below that value. The pool will open this amount of connections during
-	 * initialization. Optional, defaults to 1.
+	 * initialization. Can also be called at runtime after initialization.
 	 * 
-	 * @param minPoolSize
+	 * @param minPoolSize The new minimum pool size
 	 */
 	public void setMinPoolSize(int minPoolSize) {
 		this.minPoolSize = minPoolSize;
+		if (connectionPool != null) {
+			try {
+				connectionPool.setMinPoolSize(minPoolSize);
+			} catch (ConnectionPoolException e) {
+				LOGGER.logWarning("Failed to update minPoolSize at runtime", e);
+			}
+		}
 	}
 
 	/**
-	 * Get the maximum pool size. 
+	 * Get the maximum pool size.
+	 * Returns configured value before init, current runtime value after init.
 	 */
 	public int getMaxPoolSize() {
+		if (connectionPool != null) {
+			return connectionPool.getMaxPoolSize();
+		}
 		return maxPoolSize;
 	}
 
 	/**
 	 * Sets the maximum pool size. The amount of pooled connections won't go
-	 * above this value. Optional, defaults to 1.
+	 * above this value. Can also be called at runtime after initialization.
 	 * 
-	 * @param maxPoolSize
+	 * @param maxPoolSize The new maximum pool size
 	 */
 	public void setMaxPoolSize(int maxPoolSize) {
 		this.maxPoolSize = maxPoolSize;
+		if (connectionPool != null) {
+			try {
+				connectionPool.setMaxPoolSize(maxPoolSize);
+			} catch (ConnectionPoolException e) {
+				LOGGER.logWarning("Failed to update maxPoolSize at runtime", e);
+			}
+		}
 	}
 
 	/**
 	 * Sets both the minimal and maximal pool size. 
-	 * Required if the maxPoolSize is not set. Overrides any minPoolSize
-	 * or maxPoolSize settings you might have configured before!
+	 * Can be called at runtime after initialization.
+	 * 
+	 * @param poolSize The new pool size (sets both min and max)
 	 */
 	public void setPoolSize(int poolSize) {
 		this.minPoolSize = poolSize; 
 		this.maxPoolSize = poolSize;
+		if (connectionPool != null) {
+			try {
+				connectionPool.setPoolSizeRange(poolSize, poolSize);
+			} catch (ConnectionPoolException e) {
+				LOGGER.logWarning("Failed to update pool size range at runtime", e);
+			}
+		}
+	}
+	
+	/**
+	 * Sets pool size range atomically. New method for runtime updates.
+	 * 
+	 * @param minPoolSize The new minimum pool size
+	 * @param maxPoolSize The new maximum pool size
+	 */
+	public void setPoolSizeRange(int minPoolSize, int maxPoolSize) {
+		this.minPoolSize = minPoolSize;
+		this.maxPoolSize = maxPoolSize;
+		if (connectionPool != null) {
+			try {
+				connectionPool.setPoolSizeRange(minPoolSize, maxPoolSize);
+			} catch (ConnectionPoolException e) {
+				LOGGER.logWarning("Failed to update pool size range at runtime", e);
+			}
+		}
+	}
+	
+	/**
+	 * Resets pool sizes to their originally configured values.
+	 * This provides a rollback mechanism for runtime changes.
+	 */
+	public void resetPoolSizes() {
+		if (connectionPool != null) {
+			try {
+				connectionPool.resetPoolSizes();
+				// Update local fields to match
+				this.minPoolSize = connectionPool.getConfiguredMinPoolSize();
+				this.maxPoolSize = connectionPool.getConfiguredMaxPoolSize();
+			} catch (ConnectionPoolException e) {
+				LOGGER.logWarning("Failed to reset pool sizes", e);
+			}
+		}
+	}
+	
+	/**
+	 * Gets the configured (original) minimum pool size.
+	 * 
+	 * @return configured minimum pool size
+	 */
+	public int getConfiguredMinPoolSize() {
+		if (connectionPool != null) {
+			return connectionPool.getConfiguredMinPoolSize();
+		}
+		return minPoolSize;
+	}
+	
+	/**
+	 * Gets the configured (original) maximum pool size.
+	 * 
+	 * @return configured maximum pool size
+	 */
+	public int getConfiguredMaxPoolSize() {
+		if (connectionPool != null) {
+			return connectionPool.getConfiguredMaxPoolSize();
+		}
+		return maxPoolSize;
 	}
 
 	/**
