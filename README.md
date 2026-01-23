@@ -61,6 +61,8 @@ See [Getting Started](http://www.atomikos.com/Documentation/GettingStarted) for 
 
 See documentation at [www.atomikos.com/Documentation](http://www.atomikos.com/Documentation/)
 
+**Technical Deep Dive**: For an in-depth analysis of how Atomikos manages transaction logging (tmlog file), including transaction states, recovery mechanisms, and behavior in failure scenarios, see [ATOMIKOS_TMLOG_RESEARCH.md](ATOMIKOS_TMLOG_RESEARCH.md)
+
 ### Code Samples
 
 Register and download from [www.atomikos.com](http://www.atomikos.com/)
