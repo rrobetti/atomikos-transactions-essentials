@@ -9,6 +9,7 @@ This document provides a comprehensive analysis of how Atomikos uses its transac
 - [Transaction States](#transaction-states)
 - [Scenario 1: Successful Transaction](#scenario-1-successful-transaction)
 - [Scenario 2: Commit Failure After Prepare Success](#scenario-2-commit-failure-after-prepare-success)
+- [Scenario 3: Queue Succeeded, Database Failed, No Prepared Transaction](#scenario-3-queue-succeeded-database-failed-no-prepared-transaction)
 - [Critical Question: Rollback After Prepare Success?](#critical-question-rollback-after-prepare-success)
 
 ---
@@ -402,3 +403,316 @@ Atomikos' tmlog file is a critical component for ensuring transaction durability
 5. **No automatic rollback after prepare** - Once committed to commit, the system tries to commit, not rollback
 
 This design ensures ACID properties while exposing the fundamental limitations of distributed transactions.
+
+---
+
+## Scenario 3: Queue Succeeded, Database Failed, No Prepared Transaction
+
+### Real-World Problem
+
+A common scenario encountered in production:
+- **Message appeared in the queue** (succeeded)
+- **Record did NOT appear in database** (failed)
+- **Oracle DBA found NO prepared transactions** in the database
+- **tmlog files were not available** for inspection
+
+**Question**: What is the most likely explanation for this scenario? Could the transaction have timed out and been rolled back?
+
+### Answer: Timeout During Prepare Phase
+
+**YES** - The most likely explanation is that the transaction **timed out or failed during the PREPARE phase** before ever reaching the IN_DOUBT state.
+
+### Why This Happens
+
+#### Timeline of Events:
+
+```mermaid
+stateDiagram-v2
+    [*] --> ACTIVE: Transaction begins
+    
+    note right of ACTIVE
+        Application sends message to queue
+        Queue operation succeeds ✓
+        Transaction timeout clock starts
+    end note
+    
+    ACTIVE --> PREPARING: commit() called
+    
+    note right of PREPARING
+        Coordinator calls prepare() on:
+        1. Queue Manager → SUCCESS ✓
+        2. Database → TIMEOUT or FAILURE ✗
+    end note
+    
+    state prepare_result <<choice>>
+    PREPARING --> prepare_result: Check prepare results
+    
+    prepare_result --> ABORTING: Any prepare fails/timeouts
+    prepare_result --> IN_DOUBT: All prepare succeed
+    
+    note right of ABORTING
+        ✓ LOGGED to tmlog
+        Automatic rollback initiated
+        Rollback sent to:
+        - Queue Manager (compensate)
+        - Database (was never prepared)
+    end note
+    
+    ABORTING --> TERMINATED: Rollback complete
+    
+    note right of TERMINATED
+        Transaction rolled back cleanly
+        No IN_DOUBT state reached
+        Database never had prepared transaction
+        Queue message remains (issue!)
+    end note
+    
+    TERMINATED --> [*]: Transaction complete
+    
+    note right of IN_DOUBT
+        NOT REACHED in this scenario
+        This is why Oracle shows
+        no prepared transactions
+    end note
+```
+
+### Detailed Explanation
+
+#### 1. Transaction Starts (ACTIVE State)
+- Application code begins transaction
+- Message is sent to queue and succeeds
+- Database operation has not yet been prepared
+- Transaction timeout clock is running
+
+#### 2. Prepare Phase Begins (PREPARING State)
+When `commit()` is called, coordinator attempts to prepare both participants:
+
+**Queue Manager prepare()**:
+- Called first (or in parallel with database)
+- Returns vote: **YES** ✓
+- Queue manager locks the message for commit
+
+**Database prepare()**:
+- Called but encounters one of these issues:
+  - **Network timeout** to Oracle database
+  - **Database response timeout** (slow query, lock contention)
+  - **Transaction timeout exceeded** (> 10 seconds default)
+  - **Database connection failure**
+- Returns vote: **NO** ✗ or **TIMEOUT** ✗
+
+#### 3. Prepare Failure Triggers Rollback
+From `ActiveStateHandler.java` (lines 184-207):
+```java
+// If ANY participant votes NO or times out during prepare:
+rollbackWithAfterCompletionNotification(new RollbackCallback() {
+    rollbackFromWithinCallback(true, false);
+});
+throw new RollbackException("Prepare: NO vote");
+```
+
+**Key behavior**:
+- Transaction **immediately transitions to ABORTING state**
+- Coordinator sends **rollback** to Queue Manager (to undo the prepared message)
+- Database is NOT sent anything (it never reached prepared state)
+- Transaction moves to TERMINATED then ABANDONED
+- **IN_DOUBT state is NEVER reached**
+
+#### 4. Why Oracle Shows No Prepared Transactions
+The database never entered prepared state because:
+- The `prepare()` call to Oracle timed out or failed
+- Oracle never created an in-doubt transaction
+- The XA transaction was rolled back automatically by Atomikos
+- The database connection was closed, cleaning up any partial work
+
+#### 5. Why Queue Message Persists
+This is the **critical issue** with this scenario:
+
+**Problem**: The queue manager prepared successfully and was ready to commit, but after the database prepare failed, Atomikos sent a rollback to the queue manager. However:
+
+- **Best case**: Queue manager successfully processes the rollback and removes the message
+- **Worst case**: Queue manager already committed the message (timing issue) or the rollback fails
+- **Common case**: The rollback instruction arrives, but the message was already consumed by a competing consumer
+
+**Result**: Message appears in queue, but corresponding database record does not exist.
+
+### Timeout Configuration
+
+From `transactions-defaults.properties` and `ActiveStateHandler.java`:
+
+| Setting | Default Value | Description |
+|---------|--------------|-------------|
+| `default_jta_timeout` | 10,000 ms (10s) | Default transaction timeout |
+| `max_timeout` | 300,000 ms (5min) | Maximum allowed timeout |
+| `rollback_ticks` | 30 ticks × 150ms | Time before forced rollback in ACTIVE state |
+
+**How timeout is checked**:
+- `ActiveStateHandler.onTimeout()` (lines 60-98): Called periodically (every ~150ms)
+- Increments `rollbackTicks_` counter
+- After 30 ticks (~4.5 seconds), forces rollback if transaction is still in ACTIVE state
+- During PREPARING state, if prepare takes too long, throws timeout exception
+
+### Most Likely Scenarios (Ordered by Probability)
+
+#### Scenario A: Database Prepare Timeout (Most Likely)
+```
+1. Transaction starts, timeout = 10s
+2. Queue operation completes quickly (100ms)
+3. commit() called at T=8s (2 seconds before timeout)
+4. Queue Manager prepare() succeeds (200ms)
+5. Database prepare() is slow:
+   - Network latency: 500ms
+   - Locked table: waits 2+ seconds
+   - Total time: > 2s remaining timeout
+6. Timeout exceeded during database prepare()
+7. Atomikos aborts transaction
+8. Queue rollback sent (may or may not succeed)
+9. Result: Queue message persists, no database record
+```
+
+**Evidence**: No tmlog entry in IN_DOUBT state, Oracle shows no prepared transaction
+
+#### Scenario B: Database Connection Failure During Prepare
+```
+1. Queue operation succeeds
+2. commit() called
+3. Queue Manager prepare() succeeds
+4. Database prepare() fails:
+   - Connection lost
+   - Database down
+   - Network partition
+5. Prepare returns NO vote
+6. Atomikos rolls back transaction
+7. Queue rollback sent (may fail if queue connection also lost)
+```
+
+**Evidence**: No prepared state reached, no tmlog entry
+
+#### Scenario C: Database Prepare Exception
+```
+1. Queue operation succeeds
+2. commit() called
+3. Queue Manager prepare() succeeds
+4. Database prepare() throws exception:
+   - Constraint violation detected during prepare
+   - Lock timeout
+   - Deadlock detected
+5. Atomikos rolls back transaction
+6. Queue rollback sent
+```
+
+**Evidence**: Database logs would show the exception
+
+### Diagnostics and Prevention
+
+#### To Diagnose the Root Cause:
+
+1. **Check Atomikos logs** around the time of incident:
+   - Look for: `"Transaction X has timed out - rolling back"`
+   - Look for: `"Prepare: NO vote"`
+   - Look for: `"RollbackException"`
+
+2. **Check Oracle alert logs**:
+   - Look for connection errors
+   - Look for ORA-02049 (timeout in distributed transaction)
+   - Look for network errors
+
+3. **Check Queue Manager logs**:
+   - Look for prepare success followed by rollback
+   - Check if message was committed despite rollback instruction
+
+4. **Check application logs**:
+   - Transaction timeout exceptions
+   - Connection pool exhaustion
+   - Slow query warnings
+
+#### To Prevent This Issue:
+
+1. **Increase transaction timeout**:
+   ```java
+   @Transactional(timeout = 30)  // 30 seconds instead of 10
+   ```
+
+2. **Optimize database operations**:
+   - Add indexes to avoid table scans during prepare
+   - Reduce lock contention
+   - Use connection pooling properly
+
+3. **Monitor transaction duration**:
+   - Alert if transactions approach timeout threshold
+   - Log prepare phase duration for each participant
+
+4. **Implement idempotent consumers**:
+   - Queue consumers should check if record exists in database
+   - Prevent duplicate processing of messages
+
+5. **Use queue transaction features**:
+   - If using JMS, ensure proper XA configuration
+   - Consider using transactional queues with automatic rollback
+
+### Summary for Your Specific Scenario
+
+**What happened**:
+- Transaction started with default 10-second timeout
+- Queue message send succeeded quickly
+- `commit()` was called
+- Queue Manager prepared successfully
+- Database prepare either **timed out** or **failed** (connection issue, lock contention, slow query)
+- Atomikos detected prepare failure
+- Transaction rolled back **before reaching IN_DOUBT state**
+- Rollback sent to Queue Manager (but message may have already been committed or consumed)
+- Result: Message in queue, no database record, no prepared transaction in Oracle
+
+**Why no tmlog entry for prepared state**:
+- The transaction never reached IN_DOUBT state
+- IN_DOUBT only occurs when **all participants vote YES** during prepare
+- Since database prepare failed, the transaction went ACTIVE → PREPARING → ABORTING → TERMINATED
+- Only ABORTING state would be logged to tmlog (if at all)
+
+**Why Oracle shows no prepared transaction**:
+- Oracle never successfully completed the prepare phase
+- The XA transaction ID was never registered as "in-doubt" in Oracle
+- Oracle cleaned up the partial transaction when connection closed or timeout occurred
+
+**Could Atomikos send rollback to database after prepare succeeded?**:
+- In this scenario: **NO** - the database prepare never succeeded
+- In general: **NO** - as documented in Scenario 2, once all prepares succeed (IN_DOUBT state), Atomikos will not rollback
+
+**Conclusion**: This is a **known limitation of distributed transactions** where one participant (queue) succeeds but another (database) fails during prepare. The solution requires **idempotent message processing** to handle duplicate or orphaned messages.
+
+
+---
+
+## Implementation References
+
+Key source files analyzed:
+
+- `TxState.java` - State definitions and transition rules
+- `StateRecoveryManagerImp.java` - Triggers logging on state entry (lines 34-51)
+- `OltpLogImp.java` - Validates and persists records (line 48)
+- `RecoveryLogImp.java` - Recovery and cleanup operations (lines 75-102)
+- `RecoveryDomainService.java` - Periodic recovery scans
+- `CommitMessage.java` - Commit phase implementation (lines 54-67)
+- `TerminationResult.java` - Heuristic outcome detection (lines 111-117)
+- `HeurHazardStateHandler.java` - Handles HEUR_HAZARD state
+- `HeurMixedStateHandler.java` - Handles HEUR_MIXED state
+- `IndoubtStateHandler.java` - Handles IN_DOUBT state and timeout
+- `ActiveStateHandler.java` - Handles ACTIVE state timeout and prepare phase (lines 60-98, 139-207)
+- `CoordinatorImp.java` - Coordinator implementation with rollback tick configuration (lines 62-63)
+- `transactions-defaults.properties` - Default timeout configuration
+
+---
+
+## Conclusion
+
+Atomikos' tmlog file is a critical component for ensuring transaction durability and recovery. Key takeaways:
+
+1. **Only recoverable states are logged** (PREPARING, IN_DOUBT, COMMITTING, ABORTING, HEUR_*)
+2. **IN_DOUBT state is the most critical** - it represents the point of no return for commit decision
+3. **Transactions can timeout and rollback BEFORE reaching IN_DOUBT** - This is a common scenario when prepare phase times out
+4. **Recovery is retry-based** - The system attempts to complete the original decision, not reverse it
+5. **Heuristic outcomes are possible** - When participants cannot be reached or fail, manual intervention may be needed
+6. **No automatic rollback after prepare** - Once committed to commit, the system tries to commit, not rollback
+7. **Prepare phase failures result in automatic rollback** - No IN_DOUBT state is reached, explaining scenarios where queue succeeds but database shows no prepared transaction
+
+This design ensures ACID properties while exposing the fundamental limitations of distributed transactions.
+
