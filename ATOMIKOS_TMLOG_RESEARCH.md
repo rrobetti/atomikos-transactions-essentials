@@ -7,6 +7,7 @@ This document provides a comprehensive analysis of how Atomikos uses its transac
 - [When Transactions are Stored to tmlog](#when-transactions-are-stored-to-tmlog)
 - [When Transactions are Removed from tmlog](#when-transactions-are-removed-from-tmlog)
 - [Transaction States](#transaction-states)
+- [Timeout Configuration and ABANDONED State](#timeout-configuration-and-abandoned-state)
 - [Scenario 1: Successful Transaction](#scenario-1-successful-transaction)
 - [Scenario 2: Commit Failure After Prepare Success](#scenario-2-commit-failure-after-prepare-success)
 - [Scenario 3: Queue Succeeded, Database Failed, No Prepared Transaction](#scenario-3-queue-succeeded-database-failed-no-prepared-transaction)
@@ -136,6 +137,305 @@ From `TxState.java`, these transitions are enforced:
 - **IN_DOUBT** → ABORTING, COMMITTING, ABANDONED, TERMINATED
 - **COMMITTING** → HEUR_ABORTED, HEUR_COMMITTED, HEUR_HAZARD, HEUR_MIXED, TERMINATED, ABANDONED
 - **ABORTING** → HEUR_ABORTED, HEUR_COMMITTED, HEUR_HAZARD, HEUR_MIXED, TERMINATED, ABANDONED
+
+---
+
+## Timeout Configuration and ABANDONED State
+
+### Overview of Atomikos Timeouts
+
+Atomikos uses several timeout configurations that control transaction lifecycle, recovery, and cleanup. Understanding these timeouts is critical for diagnosing issues like orphaned transactions, heuristic outcomes, and database inconsistencies.
+
+### Atomikos Timeout Properties
+
+All timeout configurations are set in `transactions-defaults.properties` or programmatically via the TransactionManager API.
+
+#### 1. `default_jta_timeout`
+
+**Property**: `com.atomikos.icatch.default_jta_timeout`  
+**Default**: `10000` ms (10 seconds)  
+**Purpose**: The default timeout applied when a new transaction starts
+
+**What it controls**:
+- Maximum time a transaction can run from `begin()` to `commit()`/`rollback()`
+- If exceeded, the transaction is automatically rolled back
+- Applied to all transactions unless overridden
+
+**How to override**:
+```java
+// Programmatically set timeout for next transaction
+userTransaction.setTransactionTimeout(30); // 30 seconds
+
+// Or via annotation (Spring/Jakarta EE)
+@Transactional(timeout = 30)
+public void myMethod() { ... }
+```
+
+**Implementation**: `TransactionManagerImp.java` line 99-102
+
+#### 2. `max_timeout`
+
+**Property**: `com.atomikos.icatch.max_timeout`  
+**Default**: `300000` ms (5 minutes)  
+**Purpose**: Maximum allowed timeout for any transaction in the system
+
+**What it controls**:
+- Acts as a ceiling for transaction timeout values
+- If `setTransactionTimeout(n)` is called with `n > max_timeout`, the value is capped at `max_timeout`
+- Prevents transactions from running indefinitely
+
+**Relationship to default_jta_timeout**:
+```
+0 ≤ individual transaction timeout ≤ max_timeout
+default_jta_timeout is the initial value if not explicitly set
+```
+
+**Implementation**: `TransactionServiceImp.java` line 237-240
+
+#### 3. `recovery_delay`
+
+**Property**: `com.atomikos.icatch.recovery_delay` (not explicitly in defaults, uses `default_jta_timeout`)  
+**Default**: Same as `default_jta_timeout` (10 seconds)  
+**Purpose**: Delay between recovery scans for in-doubt transactions
+
+**What it controls**:
+- How often the recovery service scans tmlog for transactions requiring recovery
+- Shorter delays = faster recovery but higher CPU usage
+- Longer delays = slower recovery but lower overhead
+
+#### 4. `forget_orphaned_log_entries_delay`
+
+**Property**: `com.atomikos.icatch.forget_orphaned_log_entries_delay`  
+**Default**: `86400000` ms (24 hours)  
+**Purpose**: Delay before removing orphaned log entries from tmlog
+
+**What it controls**:
+- How long Atomikos keeps log entries for ABANDONED and old TERMINATED transactions
+- After this delay, entries are permanently removed from tmlog
+- Prevents tmlog from growing indefinitely
+
+**Implementation**: `CachedRepository.java` - removes entries where `(entry.expires + forget_orphaned_log_entries_delay) < currentTime`
+
+### Oracle XA Timeout Configuration
+
+Oracle has its own timeout settings that interact with Atomikos:
+
+#### 1. Oracle Distributed Lock Timeout
+
+**Parameter**: `distributed_lock_timeout`  
+**Default**: `60` seconds  
+**Purpose**: Maximum time Oracle keeps a prepared XA transaction before automatically rolling it back
+
+**How to check**:
+```sql
+SELECT name, value FROM v$parameter 
+WHERE name = 'distributed_lock_timeout';
+```
+
+**How to change**:
+```sql
+ALTER SYSTEM SET distributed_lock_timeout = 120 SCOPE=BOTH;
+```
+
+**Critical Configuration Rule**:
+```
+Oracle distributed_lock_timeout SHOULD BE > Atomikos max_timeout
+
+Example:
+  Atomikos max_timeout = 300 seconds (5 minutes)
+  Oracle distributed_lock_timeout = 360 seconds (6 minutes)
+```
+
+If Oracle timeout < Atomikos timeout, Oracle may rollback prepared transactions before Atomikos can commit them, causing HEUR_MIXED outcomes.
+
+#### 2. Oracle XA Transaction Timeout (Set by Atomikos)
+
+**How it works**: Atomikos calls `XAResource.setTransactionTimeout(seconds)` on Oracle XA resources
+
+**Implementation**: `XAResourceTransaction.java` line 75:
+```java
+this.timeout = transaction.getTimeout() / 1000; // Convert ms to seconds
+xaresource.setTransactionTimeout(this.timeout);
+```
+
+**What it does**:
+- Tells Oracle how long to wait for commit/rollback after prepare
+- If commit doesn't arrive within this time, Oracle may heuristically rollback
+
+### ABANDONED State
+
+#### What is ABANDONED?
+
+**ABANDONED** is a transaction state indicating that a transaction exceeded `max_timeout` without completing, even in recovery states.
+
+**Legal transitions TO ABANDONED**:
+- PREPARING → ABANDONED
+- IN_DOUBT → ABANDONED  
+- COMMITTING → ABANDONED
+- ABORTING → ABANDONED
+
+#### When Does a Transaction Enter ABANDONED?
+
+A transaction enters ABANDONED state when:
+
+1. **Timeout in recoverable state**: Transaction is in PREPARING, IN_DOUBT, COMMITTING, or ABORTING state
+2. **Max timeout exceeded**: The transaction has been in that state longer than `max_timeout`
+3. **Recovery attempts exhausted**: Recovery service has tried to complete the transaction but failed
+
+**Example timeline**:
+```
+T=0s:      Transaction starts
+T=5s:      commit() called, enters PREPARING
+T=6s:      prepare() succeeds on all resources, enters IN_DOUBT
+T=7s:      COMMITTING state begins
+T=10s:     Commit fails on database, enters HEUR_HAZARD
+T=310s:    max_timeout (300s) exceeded
+T=310s:    Transaction moves to ABANDONED state
+```
+
+**Implementation**: `CoordinatorStateHandler.java` lines 634-638:
+```java
+private void removePendingOltpCoordinatorFromTransactionService() {
+    coordinator.setState(TxState.ABANDONED);
+    coordinator.dispose();
+    LOGGER.logWarning("Abandoning " + coordinator.getCoordinatorId() + 
+        " in state " + state + " after timeout - recovery will cleanup in the background");
+}
+```
+
+#### Is ABANDONED Logged to tmlog?
+
+**NO** - ABANDONED is **NOT a recoverable state**. From the code analysis:
+
+**Non-recoverable states** (never logged to tmlog):
+- ACTIVE
+- MARKED_ABORT
+- COMMITTED
+- ABORTED
+- **ABANDONED** ← Not logged
+
+When a transaction transitions to ABANDONED:
+1. The coordinator is disposed (all resources released)
+2. The state is set to ABANDONED locally
+3. **No tmlog write occurs** for the ABANDONED state itself
+
+However, the transaction may have been logged in a previous recoverable state (PREPARING, IN_DOUBT, COMMITTING, ABORTING) before transitioning to ABANDONED.
+
+#### Is ABANDONED Eventually Removed from tmlog?
+
+**YES** - Indirectly, via the cleanup mechanism for orphaned entries.
+
+**The cleanup process**:
+
+1. **Last logged state**: Before ABANDONED, the transaction was in a recoverable state (e.g., IN_DOUBT, HEUR_HAZARD) and was logged to tmlog
+
+2. **Transition to ABANDONED**: When max_timeout is exceeded, the transaction moves to ABANDONED state locally (in memory), but this state change is NOT written to tmlog
+
+3. **tmlog entry becomes orphaned**: The tmlog still has the old recoverable state entry (e.g., IN_DOUBT from T=6s), but the in-memory coordinator is now ABANDONED
+
+4. **Expiry calculation**: Each tmlog entry has an expiry timestamp:
+   ```
+   entry.expires = entry.timestamp + transaction.timeout
+   ```
+
+5. **Orphaned entry removal**: After `forget_orphaned_log_entries_delay` (default 24 hours), the entry is removed:
+   ```
+   if (currentTime > entry.expires + forget_orphaned_log_entries_delay) {
+       remove entry from tmlog
+   }
+   ```
+
+**Timeline example**:
+```
+T=0s:      Transaction starts (timeout = 300s)
+T=6s:      IN_DOUBT state, logged to tmlog with expires = T+300s = 306s
+T=310s:    max_timeout exceeded, moves to ABANDONED (not logged)
+T=306s:    tmlog entry "expires" timestamp passes
+T=86706s:  forget_orphaned_log_entries_delay (24h) expires
+T=86706s:  Recovery service removes the orphaned IN_DOUBT entry from tmlog
+```
+
+**Implementation**: `CachedRepository.java` cleanup logic removes entries based on:
+```java
+if (now > coordinatorLogEntry.expires + forgetOrphanedLogEntriesDelay) {
+    repository.remove(coordinatorLogEntry);
+}
+```
+
+### Timeout Interaction Summary
+
+#### Scenario: Atomikos timeout < Oracle timeout
+
+**Configuration**:
+- Atomikos: `default_jta_timeout = 10s`, `max_timeout = 300s`
+- Oracle: `distributed_lock_timeout = 60s`
+
+**What happens**:
+1. Transaction starts, runs for 8 seconds
+2. `commit()` called at T=8s (2s before Atomikos timeout)
+3. Both resources prepare successfully, IN_DOUBT state at T=8.5s
+4. Atomikos attempts to send commit but experiences network delay
+5. At T=18s, Atomikos transaction timeout (10s) expires
+6. Atomikos marks transaction as timed out, but it's already in IN_DOUBT (cannot rollback)
+7. Recovery attempts continue until T=308s (max_timeout)
+8. At T=308s, transaction moves to ABANDONED state
+9. At T=68.5s, Oracle's 60-second timeout expires, Oracle rolls back prepared transaction
+10. Later, when Atomikos retry finally reaches Oracle: "transaction not found" error
+11. Result: HEUR_MIXED state (if queue already committed)
+
+**Problem**: Atomikos timeout doesn't prevent Oracle from making a heuristic decision.
+
+#### Scenario: Oracle timeout < Atomikos timeout (DANGEROUS)
+
+**Configuration**:
+- Atomikos: `default_jta_timeout = 120s`, `max_timeout = 300s`  
+- Oracle: `distributed_lock_timeout = 60s`
+
+**What happens**:
+1. Transaction prepares successfully on both resources at T=5s
+2. IN_DOUBT state reached, commit decision made
+3. Delay occurs before commit messages are sent (network lag, GC pause, etc.)
+4. At T=65s, Oracle timeout (60s) expires **before** Atomikos sends commit
+5. Oracle automatically rolls back the prepared transaction
+6. At T=70s, Atomikos sends commit to both resources:
+   - Queue commits successfully → message becomes visible
+   - Oracle returns error: "ORA-24756: transaction does not exist"
+7. Result: HEUR_MIXED state - queue committed, database rolled back
+
+**Problem**: Oracle heuristically decides to rollback before Atomikos can execute its commit decision.
+
+### Best Practices for Timeout Configuration
+
+1. **Oracle timeout > Atomikos max_timeout**:
+   ```properties
+   # Atomikos
+   com.atomikos.icatch.max_timeout=300000  # 5 minutes
+   
+   # Oracle
+   distributed_lock_timeout=360  # 6 minutes
+   ```
+
+2. **Short default timeout, higher max**:
+   ```properties
+   com.atomikos.icatch.default_jta_timeout=30000    # 30 seconds (most transactions)
+   com.atomikos.icatch.max_timeout=300000            # 5 minutes (for long-running)
+   ```
+
+3. **Monitor transaction duration**:
+   - Alert if transactions approach timeout threshold
+   - Log prepare-to-commit duration
+   - Track ABANDONED transactions
+
+4. **Tune forget_orphaned_log_entries_delay based on retention needs**:
+   ```properties
+   # Keep orphaned entries for 7 days for forensics
+   com.atomikos.icatch.forget_orphaned_log_entries_delay=604800000
+   ```
+
+5. **Consider single-threaded 2PC** to control commit order:
+   ```properties
+   com.atomikos.icatch.single_threaded_2pc=true
+   ```
 
 ---
 
