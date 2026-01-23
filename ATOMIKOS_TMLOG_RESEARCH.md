@@ -406,23 +406,54 @@ This design ensures ACID properties while exposing the fundamental limitations o
 
 ---
 
+
 ## Scenario 3: Queue Succeeded, Database Failed, No Prepared Transaction
 
 ### Real-World Problem
 
 A common scenario encountered in production:
-- **Message appeared in the queue** (succeeded)
+- **Message appeared in the queue** (visible to consumers)
 - **Record did NOT appear in database** (failed)
 - **Oracle DBA found NO prepared transactions** in the database
-- **tmlog files were not available** for inspection
+- **tmlog files were not available** for inspection at the time of the issue
 
 **Question**: What is the most likely explanation for this scenario? Could the transaction have timed out and been rolled back?
 
-### Answer: Timeout During Prepare Phase
+### Answer: Oracle Prepared Transaction Timeout or Commit Phase Failure
 
-**YES** - The most likely explanation is that the transaction **timed out or failed during the PREPARE phase** before ever reaching the IN_DOUBT state.
+**Important Clarification**: Since the message **is visible in the queue**, this means the queue resource **successfully committed**. In XA transactions, messages are locked and invisible until commit succeeds. Therefore, prepare must have succeeded on both resources, and the commit phase must have started.
+
+**Most Likely Scenarios** (in order of probability):
+
+1. **Oracle prepared transaction timed out** before Atomikos could commit it
+2. **Commit phase failed on database** after succeeding on queue
+3. **Oracle heuristically rolled back** the prepared transaction
 
 ### Why This Happens
+
+#### Understanding XA Transaction Flow
+
+**Critical Fact**: In JMS/XA transactions, messages are sent during application code but remain **invisible** (locked) until the transaction commits. The message only becomes visible to consumers after a successful commit.
+
+```
+Application Code:
+  producer.send(message)  ← Message sent but LOCKED in queue
+  dao.insert(record)       ← Database operation executed
+  
+Transaction Commit:
+  prepare(queue)    → Vote: YES  (message still locked)
+  prepare(database) → Vote: YES  (DB in prepared state)
+  [IN_DOUBT state reached - logged to tmlog]
+  
+  commit(queue)     → SUCCESS ✓ (message now VISIBLE)
+  commit(database)  → ??? 
+```
+
+Since the message **is visible**, we know:
+- Prepare succeeded on both resources
+- IN_DOUBT state was reached
+- Commit was sent to queue and succeeded
+- Something went wrong with the database commit
 
 #### Timeline of Events:
 
@@ -431,288 +462,332 @@ stateDiagram-v2
     [*] --> ACTIVE: Transaction begins
     
     note right of ACTIVE
-        Application sends message to queue
-        Queue operation succeeds ✓
-        Transaction timeout clock starts
+        Application code:
+        - Message sent to queue (LOCKED)
+        - Database insert executed
+        - commit() called
     end note
     
-    ACTIVE --> PREPARING: commit() called
+    ACTIVE --> PREPARING: commit() initiates 2PC
     
     note right of PREPARING
-        Coordinator calls prepare() on:
-        1. Queue Manager → SUCCESS ✓
-        2. Database → TIMEOUT or FAILURE ✗
+        Prepare phase:
+        - Queue prepare() → YES ✓
+        - Database prepare() → YES ✓
+        - Oracle creates prepared transaction
     end note
     
-    state prepare_result <<choice>>
-    PREPARING --> prepare_result: Check prepare results
-    
-    prepare_result --> ABORTING: Any prepare fails/timeouts
-    prepare_result --> IN_DOUBT: All prepare succeed
-    
-    note right of ABORTING
-        ✓ LOGGED to tmlog
-        Automatic rollback initiated
-        Rollback sent to:
-        - Queue Manager (compensate)
-        - Database (was never prepared)
-    end note
-    
-    ABORTING --> TERMINATED: Rollback complete
-    
-    note right of TERMINATED
-        Transaction rolled back cleanly
-        No IN_DOUBT state reached
-        Database never had prepared transaction
-        Queue message remains (issue!)
-    end note
-    
-    TERMINATED --> [*]: Transaction complete
+    PREPARING --> IN_DOUBT: All prepare() succeed
     
     note right of IN_DOUBT
-        NOT REACHED in this scenario
-        This is why Oracle shows
-        no prepared transactions
+        ✓ LOGGED to tmlog
+        Both resources prepared
+        Commit decision made
+        Oracle has IN-DOUBT transaction
+    end note
+    
+    IN_DOUBT --> COMMITTING: Commit phase begins
+    
+    note right of COMMITTING
+        ✓ LOGGED to tmlog
+        Commit sent to resources
+        (order is indeterminate)
+    end note
+    
+    state commit_scenario <<choice>>
+    COMMITTING --> commit_scenario: Check outcomes
+    
+    commit_scenario --> ScenarioA: Oracle timeout
+    commit_scenario --> ScenarioB: Commit failure
+    commit_scenario --> ScenarioC: Heuristic rollback
+    
+    state ScenarioA {
+        [*] --> OracleTimeout: Oracle XA timeout expires
+        OracleTimeout --> OracleRollback: Oracle rolls back prepared TX
+        OracleRollback --> QueueCommits: Queue commit() succeeds
+        QueueCommits --> AtomikosCommitFails: Atomikos commit(DB) gets error
+        AtomikosCommitFails --> HEUR_MIXED_A: Transaction state
+    }
+    
+    state ScenarioB {
+        [*] --> QueueCommitsFirst: Queue commit() succeeds
+        QueueCommitsFirst --> DBCommitFails: Database commit() fails
+        DBCommitFails --> HEUR_MIXED_B: Transaction state
+    }
+    
+    state ScenarioC {
+        [*] --> BothPrepared: Both resources prepared
+        BothPrepared --> OracleHeurDecision: Oracle makes heuristic decision
+        OracleHeurDecision --> OracleRollsBack: Oracle timeout → rollback
+        OracleRollsBack --> QueueCommits2: Queue still commits
+        QueueCommits2 --> HEUR_MIXED_C: Transaction state
+    }
+    
+    HEUR_MIXED_A --> [*]: Message visible<br/>No DB record<br/>No prepared TX
+    HEUR_MIXED_B --> [*]: Message visible<br/>No DB record<br/>No prepared TX
+    HEUR_MIXED_C --> [*]: Message visible<br/>No DB record<br/>No prepared TX
+    
+    note right of ScenarioA
+        Oracle XA timeout fires before
+        Atomikos sends commit.
+        Oracle cleans up prepared TX.
+        When Atomikos tries to commit,
+        Oracle returns error (TX not found).
     end note
 ```
 
-### Detailed Explanation
+### Detailed Scenarios
 
-#### 1. Transaction Starts (ACTIVE State)
-- Application code begins transaction
-- Message is sent to queue and succeeds
-- Database operation has not yet been prepared
-- Transaction timeout clock is running
+#### Scenario A: Oracle XA Prepared Transaction Timeout (Most Likely)
 
-#### 2. Prepare Phase Begins (PREPARING State)
-When `commit()` is called, coordinator attempts to prepare both participants:
+**What Happened**:
+1. Transaction starts, message sent (locked), database operation executed
+2. `commit()` called, both resources prepare successfully
+3. Oracle creates a prepared XA transaction with timeout (default from Atomikos)
+4. Transaction enters IN_DOUBT state, logged to tmlog
+5. **Delay occurs** before commit phase (network issue, system load, GC pause)
+6. **Oracle's XA timeout expires** (typically 60 seconds default)
+7. **Oracle automatically rolls back** the prepared transaction to free resources
+8. Oracle removes the in-doubt transaction from its internal tables
+9. Atomikos finally sends commit to both resources:
+   - Queue commits successfully → **message becomes visible**
+   - Database commit fails with "transaction not found" or similar error
+10. Atomikos enters HEUR_HAZARD or HEUR_MIXED state
 
-**Queue Manager prepare()**:
-- Called first (or in parallel with database)
-- Returns vote: **YES** ✓
-- Queue manager locks the message for commit
+**Why Oracle Shows No Prepared Transaction**:
+- Oracle had a prepared transaction but its timeout expired
+- Oracle's automatic cleanup rolled it back
+- By the time the DBA checked (days later), the transaction was long gone
 
-**Database prepare()**:
-- Called but encounters one of these issues:
-  - **Network timeout** to Oracle database
-  - **Database response timeout** (slow query, lock contention)
-  - **Transaction timeout exceeded** (> 10 seconds default)
-  - **Database connection failure**
-- Returns vote: **NO** ✗ or **TIMEOUT** ✗
+**Evidence to Look For**:
+- Oracle alert logs: `ORA-24756: transaction does not exist`
+- Atomikos logs: `HeurHazardException` or `HeurMixedException` 
+- Check if Atomikos transaction timeout > Oracle XA timeout
 
-#### 3. Prepare Failure Triggers Rollback
-From `ActiveStateHandler.java` (lines 184-207):
-```java
-// If ANY participant votes NO or times out during prepare:
-rollbackWithAfterCompletionNotification(new RollbackCallback() {
-    rollbackFromWithinCallback(true, false);
-});
-throw new RollbackException("Prepare: NO vote");
+**Oracle XA Timeout Configuration**:
+```sql
+-- Check Oracle XA transaction timeout (default 60 seconds)
+SELECT name, value FROM v$parameter WHERE name = 'distributed_lock_timeout';
+
+-- Check for timed-out distributed transactions
+SELECT * FROM dba_2pc_pending WHERE state = 'forced rollback';
 ```
 
-**Key behavior**:
-- Transaction **immediately transitions to ABORTING state**
-- Coordinator sends **rollback** to Queue Manager (to undo the prepared message)
-- Database is NOT sent anything (it never reached prepared state)
-- Transaction moves to TERMINATED then ABANDONED
-- **IN_DOUBT state is NEVER reached**
+#### Scenario B: Commit Phase Failure After Partial Success
 
-#### 4. Why Oracle Shows No Prepared Transactions
-The database never entered prepared state because:
-- The `prepare()` call to Oracle timed out or failed
-- Oracle never created an in-doubt transaction
-- The XA transaction was rolled back automatically by Atomikos
-- The database connection was closed, cleaning up any partial work
-
-#### 5. Why Queue Message Persists
-This is the **critical issue** with this scenario:
-
-**Problem**: The queue manager prepared successfully and was ready to commit, but after the database prepare failed, Atomikos sent a rollback to the queue manager. However:
-
-- **Best case**: Queue manager successfully processes the rollback and removes the message
-- **Worst case**: Queue manager already committed the message (timing issue) or the rollback fails
-- **Common case**: The rollback instruction arrives, but the message was already consumed by a competing consumer
-
-**Result**: Message appears in queue, but corresponding database record does not exist.
-
-### Timeout Configuration
-
-From `transactions-defaults.properties` and `ActiveStateHandler.java`:
-
-| Setting | Default Value | Description |
-|---------|--------------|-------------|
-| `default_jta_timeout` | 10,000 ms (10s) | Default transaction timeout |
-| `max_timeout` | 300,000 ms (5min) | Maximum allowed timeout |
-| `rollback_ticks` | 30 ticks × 150ms | Time before forced rollback in ACTIVE state |
-
-**How timeout is checked**:
-- `ActiveStateHandler.onTimeout()` (lines 60-98): Called periodically (every ~150ms)
-- Increments `rollbackTicks_` counter
-- After 30 ticks (~4.5 seconds), forces rollback if transaction is still in ACTIVE state
-- During PREPARING state, if prepare takes too long, throws timeout exception
-
-### Most Likely Scenarios (Ordered by Probability)
-
-#### Scenario A: Database Prepare Timeout (Most Likely)
-```
-1. Transaction starts, timeout = 10s
-2. Queue operation completes quickly (100ms)
-3. commit() called at T=8s (2 seconds before timeout)
-4. Queue Manager prepare() succeeds (200ms)
-5. Database prepare() is slow:
-   - Network latency: 500ms
-   - Locked table: waits 2+ seconds
-   - Total time: > 2s remaining timeout
-6. Timeout exceeded during database prepare()
-7. Atomikos aborts transaction
-8. Queue rollback sent (may or may not succeed)
-9. Result: Queue message persists, no database record
-```
-
-**Evidence**: No tmlog entry in IN_DOUBT state, Oracle shows no prepared transaction
-
-#### Scenario B: Database Connection Failure During Prepare
-```
-1. Queue operation succeeds
-2. commit() called
-3. Queue Manager prepare() succeeds
-4. Database prepare() fails:
-   - Connection lost
-   - Database down
+**What Happened**:
+1. Both resources prepare successfully
+2. Transaction enters IN_DOUBT state
+3. Atomikos sends commit to both resources (order is indeterminate)
+4. **Queue commits first** → message becomes visible
+5. **Database commit fails**:
+   - Connection lost during commit
+   - Database crashed between prepare and commit
    - Network partition
-5. Prepare returns NO vote
-6. Atomikos rolls back transaction
-7. Queue rollback sent (may fail if queue connection also lost)
+   - Oracle instance failure
+6. Atomikos receives success from queue, failure from database
+7. Transaction enters HEUR_MIXED state
+
+**Why Oracle Shows No Prepared Transaction**:
+- If Oracle crashed, prepared transactions are rolled back on restart
+- If connection was lost, Oracle may have cleaned up the XA transaction
+- The prepared state doesn't persist across Oracle instance restarts without proper configuration
+
+**Evidence to Look For**:
+- Atomikos logs: `HeurMixedException` with details about which resource failed
+- Oracle alert logs: Instance crash or connection errors
+- Network logs: Connection failures during commit window
+
+#### Scenario C: Oracle Heuristic Rollback Decision
+
+**What Happened**:
+1. Both resources prepare successfully
+2. Transaction enters IN_DOUBT state
+3. Before Atomikos sends commit, Oracle's resource manager makes a **heuristic decision**
+4. Oracle times out and decides to rollback the prepared transaction
+5. Queue receives commit and succeeds
+6. Database returns `XA_HEURRB` (heuristic rollback)
+7. Transaction enters HEUR_MIXED state
+
+**Why Oracle Shows No Prepared Transaction**:
+- Oracle decided to rollback before receiving commit instruction
+- Prepared transaction was removed by Oracle's heuristic decision
+
+**Evidence to Look For**:
+- Atomikos logs: `XAException` with error code `XA_HEURRB` (heuristic rollback)
+- Oracle logs: Heuristic rollback decision logged
+
+### Key Findings
+
+#### Why The Message Is Visible
+
+**Critical Point**: The fact that the message is visible in the queue proves that:
+1. The queue resource **successfully committed**
+2. The prepare phase **succeeded on both resources** (otherwise queue would have rolled back)
+3. The transaction **reached IN_DOUBT state** (both voted YES)
+4. The commit phase **was initiated and succeeded on the queue**
+
+This completely rules out the theory that prepare failed on the database.
+
+#### Why Oracle Shows No Prepared Transaction
+
+Possible reasons:
+1. **Timeout expiry**: Oracle's XA timeout expired and Oracle rolled back automatically
+2. **Crash recovery**: Oracle instance crashed and rolled back prepared transactions on restart
+3. **Heuristic decision**: Oracle's XA resource manager decided to rollback due to timeout
+4. **Manual intervention**: DBA manually rolled back the prepared transaction
+5. **Connection cleanup**: Lost connection caused Oracle to cleanup the XA transaction
+
+#### Atomikos tmlog State
+
+Without the tmlog files, we can't know for certain, but the transaction likely:
+- Was logged in IN_DOUBT or COMMITTING state
+- Later transitioned to HEUR_MIXED or HEUR_HAZARD state
+- Eventually was marked as TERMINATED or ABANDONED after timeout
+- Log entry may have been cleaned up days later by recovery service
+
+### Timeout Configuration Analysis
+
+#### Atomikos Transaction Timeout
+
+From `transactions-defaults.properties`:
+```properties
+com.atomikos.icatch.default_jta_timeout=10000    # 10 seconds
+com.atomikos.icatch.max_timeout=300000            # 5 minutes
 ```
 
-**Evidence**: No prepared state reached, no tmlog entry
+This timeout is set on XA resources via `XAResource.setTransactionTimeout()`.
 
-#### Scenario C: Database Prepare Exception
-```
-1. Queue operation succeeds
-2. commit() called
-3. Queue Manager prepare() succeeds
-4. Database prepare() throws exception:
-   - Constraint violation detected during prepare
-   - Lock timeout
-   - Deadlock detected
-5. Atomikos rolls back transaction
-6. Queue rollback sent
+#### Oracle XA Transaction Timeout
+
+Oracle has its own timeout for prepared transactions:
+```sql
+-- Default is 60 seconds
+distributed_lock_timeout = 60
+
+-- If Atomikos timeout (10s) < Oracle timeout (60s)
+-- Oracle will keep the prepared TX for up to 60 seconds
+-- If commit doesn't arrive within 60s, Oracle may rollback
 ```
 
-**Evidence**: Database logs would show the exception
+#### The Timing Problem
+
+If there's a delay between prepare and commit:
+```
+T=0s:    Application starts transaction
+T=5s:    commit() called
+T=5.5s:  Prepare phase completes (both YES)
+T=5.5s:  IN_DOUBT state, tmlog written
+T=5.5s:  Atomikos tries to send commit messages
+         -- DELAY HAPPENS HERE --
+T=65s:   Oracle timeout (60s) expires
+T=65s:   Oracle rolls back prepared transaction
+T=70s:   Atomikos commit finally reaches resources
+T=70s:   Queue commits successfully (message visible)
+T=70s:   Database commit fails (transaction not found)
+T=70s:   HEUR_MIXED state
+```
 
 ### Diagnostics and Prevention
 
-#### To Diagnose the Root Cause:
+#### To Diagnose Root Cause:
 
-1. **Check Atomikos logs** around the time of incident:
-   - Look for: `"Transaction X has timed out - rolling back"`
-   - Look for: `"Prepare: NO vote"`
-   - Look for: `"RollbackException"`
+1. **Check Atomikos logs** for:
+   ```
+   HeurMixedException
+   HeurHazardException  
+   XAException with error codes:
+   - XA_HEURRB (heuristic rollback)
+   - XA_HEURMIX (heuristic mixed)
+   - XAER_NOTA (transaction not found)
+   ```
 
-2. **Check Oracle alert logs**:
-   - Look for connection errors
-   - Look for ORA-02049 (timeout in distributed transaction)
-   - Look for network errors
+2. **Check Oracle alert logs** for:
+   ```
+   ORA-24756: transaction does not exist
+   ORA-02051: another session  in same transaction failed
+   Distributed transaction timeout
+   Instance crash/restart during the time window
+   ```
 
-3. **Check Queue Manager logs**:
-   - Look for prepare success followed by rollback
-   - Check if message was committed despite rollback instruction
+3. **Check Oracle DBA_2PC_PENDING**:
+   ```sql
+   SELECT local_tran_id, state, tran_comment, fail_time, commit#
+   FROM dba_2pc_pending
+   WHERE fail_time BETWEEN <incident_start> AND <incident_end>;
+   ```
 
-4. **Check application logs**:
-   - Transaction timeout exceptions
-   - Connection pool exhaustion
-   - Slow query warnings
+4. **Check for GC pauses or system delays**:
+   - JVM garbage collection logs
+   - System load at the time of incident
+   - Network latency monitoring
 
 #### To Prevent This Issue:
 
-1. **Increase transaction timeout**:
-   ```java
-   @Transactional(timeout = 30)  // 30 seconds instead of 10
+1. **Align timeouts properly**:
+   ```properties
+   # Increase Atomikos timeout to allow for delays
+   com.atomikos.icatch.default_jta_timeout=30000  # 30 seconds
+   
+   # Ensure Oracle timeout > Atomikos timeout
+   # In Oracle: ALTER SYSTEM SET distributed_lock_timeout = 120;
    ```
 
-2. **Optimize database operations**:
-   - Add indexes to avoid table scans during prepare
-   - Reduce lock contention
-   - Use connection pooling properly
+2. **Enable single-threaded 2PC** (for consistent commit ordering):
+   ```properties
+   com.atomikos.icatch.single_threaded_2pc=true
+   ```
+   This ensures queue doesn't commit before database.
 
 3. **Monitor transaction duration**:
-   - Alert if transactions approach timeout threshold
-   - Log prepare phase duration for each participant
+   - Alert if time between prepare and commit exceeds threshold
+   - Log slow transactions
+   - Monitor queue and database latency separately
 
-4. **Implement idempotent consumers**:
-   - Queue consumers should check if record exists in database
-   - Prevent duplicate processing of messages
+4. **Implement idempotent message consumers**:
+   - Always check if database record exists before processing message
+   - Use unique message IDs to detect duplicates
+   - Handle "message without database record" gracefully
 
-5. **Use queue transaction features**:
-   - If using JMS, ensure proper XA configuration
-   - Consider using transactional queues with automatic rollback
+5. **Enable Oracle Distributed Transaction Recovery**:
+   ```sql
+   -- Configure pending transaction resolution
+   ALTER SYSTEM SET distributed_recovery_connection_hold_time = 200;
+   ```
+
+6. **Use tmlog archiving**:
+   - Configure Atomikos to archive tmlog files
+   - Retain logs for analysis
+   - Monitor for HEUR_MIXED transactions
 
 ### Summary for Your Specific Scenario
 
-**What happened**:
-- Transaction started with default 10-second timeout
-- Queue message send succeeded quickly
-- `commit()` was called
-- Queue Manager prepared successfully
-- Database prepare either **timed out** or **failed** (connection issue, lock contention, slow query)
-- Atomikos detected prepare failure
-- Transaction rolled back **before reaching IN_DOUBT state**
-- Rollback sent to Queue Manager (but message may have already been committed or consumed)
-- Result: Message in queue, no database record, no prepared transaction in Oracle
+**What Most Likely Happened**:
 
-**Why no tmlog entry for prepared state**:
-- The transaction never reached IN_DOUBT state
-- IN_DOUBT only occurs when **all participants vote YES** during prepare
-- Since database prepare failed, the transaction went ACTIVE → PREPARING → ABORTING → TERMINATED
-- Only ABORTING state would be logged to tmlog (if at all)
+Since the message **is visible in the queue**, this proves:
+- Both prepare() calls succeeded
+- Transaction reached IN_DOUBT state
+- Queue commit() succeeded
+- Database commit() either:
+  a) Never was called due to crash
+  b) Was called but transaction had already timed out in Oracle
+  c) Failed due to connection/network issue
 
 **Why Oracle shows no prepared transaction**:
-- Oracle never successfully completed the prepare phase
-- The XA transaction ID was never registered as "in-doubt" in Oracle
-- Oracle cleaned up the partial transaction when connection closed or timeout occurred
+- The prepared transaction existed temporarily after prepare succeeded
+- Oracle's timeout (60s default) expired before Atomikos sent the commit
+- Oracle automatically rolled back the prepared transaction
+- By the time DBA checked days later, Oracle had cleaned up all trace of it
 
-**Could Atomikos send rollback to database after prepare succeeded?**:
-- In this scenario: **NO** - the database prepare never succeeded
-- In general: **NO** - as documented in Scenario 2, once all prepares succeed (IN_DOUBT state), Atomikos will not rollback
+**Why the message persists**:
+- Queue committed successfully in the commit phase
+- This is a **HEUR_MIXED state** - different outcomes for different resources
+- This is the inherent risk of distributed transactions
 
-**Conclusion**: This is a **known limitation of distributed transactions** where one participant (queue) succeeds but another (database) fails during prepare. The solution requires **idempotent message processing** to handle duplicate or orphaned messages.
+**Could this have been prevented?**:
+- YES - by ensuring Oracle's XA timeout > Atomikos transaction timeout
+- YES - by using single-threaded 2PC to control commit order
+- YES - by monitoring and alerting on slow transaction phases
+- PARTIAL - by implementing idempotent consumers to handle orphaned messages
 
-
----
-
-## Implementation References
-
-Key source files analyzed:
-
-- `TxState.java` - State definitions and transition rules
-- `StateRecoveryManagerImp.java` - Triggers logging on state entry (lines 34-51)
-- `OltpLogImp.java` - Validates and persists records (line 48)
-- `RecoveryLogImp.java` - Recovery and cleanup operations (lines 75-102)
-- `RecoveryDomainService.java` - Periodic recovery scans
-- `CommitMessage.java` - Commit phase implementation (lines 54-67)
-- `TerminationResult.java` - Heuristic outcome detection (lines 111-117)
-- `HeurHazardStateHandler.java` - Handles HEUR_HAZARD state
-- `HeurMixedStateHandler.java` - Handles HEUR_MIXED state
-- `IndoubtStateHandler.java` - Handles IN_DOUBT state and timeout
-- `ActiveStateHandler.java` - Handles ACTIVE state timeout and prepare phase (lines 60-98, 139-207)
-- `CoordinatorImp.java` - Coordinator implementation with rollback tick configuration (lines 62-63)
-- `transactions-defaults.properties` - Default timeout configuration
-
----
-
-## Conclusion
-
-Atomikos' tmlog file is a critical component for ensuring transaction durability and recovery. Key takeaways:
-
-1. **Only recoverable states are logged** (PREPARING, IN_DOUBT, COMMITTING, ABORTING, HEUR_*)
-2. **IN_DOUBT state is the most critical** - it represents the point of no return for commit decision
-3. **Transactions can timeout and rollback BEFORE reaching IN_DOUBT** - This is a common scenario when prepare phase times out
-4. **Recovery is retry-based** - The system attempts to complete the original decision, not reverse it
-5. **Heuristic outcomes are possible** - When participants cannot be reached or fail, manual intervention may be needed
-6. **No automatic rollback after prepare** - Once committed to commit, the system tries to commit, not rollback
-7. **Prepare phase failures result in automatic rollback** - No IN_DOUBT state is reached, explaining scenarios where queue succeeds but database shows no prepared transaction
-
-This design ensures ACID properties while exposing the fundamental limitations of distributed transactions.
-
+**Conclusion**: This is **not a prepare phase failure** but rather a **commit phase timing issue** where Oracle's prepared transaction timed out before Atomikos could complete the commit phase. The queue committed successfully but the database had already cleaned up its prepared state, resulting in a heuristic mixed outcome.
