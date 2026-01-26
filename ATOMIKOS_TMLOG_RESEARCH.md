@@ -11,6 +11,7 @@ This document provides a comprehensive analysis of how Atomikos uses its transac
 - [Scenario 1: Successful Transaction](#scenario-1-successful-transaction)
 - [Scenario 2: Commit Failure After Prepare Success](#scenario-2-commit-failure-after-prepare-success)
 - [Scenario 3: Queue Succeeded, Database Failed, No Prepared Transaction](#scenario-3-queue-succeeded-database-failed-no-prepared-transaction)
+- [Detailed Simulation: Queue Commits, DB Fails, Then DB Times Out](#detailed-simulation-queue-commits-db-fails-then-db-times-out)
 - [Critical Question: Rollback After Prepare Success?](#critical-question-rollback-after-prepare-success)
 
 ---
@@ -1091,3 +1092,537 @@ Since the message **is visible in the queue**, this proves:
 - PARTIAL - by implementing idempotent consumers to handle orphaned messages
 
 **Conclusion**: This is **not a prepare phase failure** but rather a **commit phase timing issue** where Oracle's prepared transaction timed out before Atomikos could complete the commit phase. The queue committed successfully but the database had already cleaned up its prepared state, resulting in a heuristic mixed outcome.
+
+---
+
+## Detailed Simulation: Queue Commits, DB Fails, Then DB Times Out
+
+### Scenario Setup
+
+This simulation walks through the exact scenario requested: both prepare succeed, queue commits successfully, database commit fails, then Oracle times out the prepared transaction before Atomikos can retry.
+
+**Configuration**:
+- Atomikos `default_jta_timeout`: 30,000 ms (30 seconds)
+- Atomikos `max_timeout`: 300,000 ms (5 minutes)
+- Oracle `distributed_lock_timeout`: 60 seconds
+- Atomikos recovery scan interval: 10 seconds
+
+**Timeline**: T=0 is when the transaction begins
+
+### Step-by-Step Timeline
+
+#### Phase 1: Transaction Execution (T=0s to T=5s)
+
+**T=0s: Transaction Begins**
+```
+TransactionManager.begin()
+- Transaction ID: TX-12345
+- Timeout: 30 seconds (default_jta_timeout)
+- State: ACTIVE
+- tmlog: NOT logged (ACTIVE is not recoverable)
+```
+
+**T=1s: Queue Operation**
+```
+producer.send(message)
+- Message sent to queue manager
+- Message is LOCKED (not visible to consumers)
+- Queue XA resource enlisted in transaction
+- State: Still ACTIVE
+- tmlog: NOT logged
+```
+
+**T=2s: Database Operation**
+```
+dao.insert(record)
+- SQL executed, data in Oracle's undo tablespace
+- Database XA resource enlisted in transaction
+- State: Still ACTIVE
+- tmlog: NOT logged
+```
+
+**T=5s: Application Calls commit()**
+```
+userTransaction.commit()
+- Atomikos coordinator initiates 2PC
+- State: Transitions to PREPARING
+- tmlog: Entry written for PREPARING state
+```
+
+#### Phase 2: Prepare Phase (T=5s to T=6s)
+
+**T=5.2s: Prepare Queue**
+```
+coordinator.prepare(queueXAResource)
+- Call: queueXAResource.prepare(xid)
+- Queue validates transaction
+- Queue locks message (still invisible)
+- Response: XA_OK (vote YES)
+- Duration: 200ms
+```
+
+**T=5.5s: Prepare Database**
+```
+coordinator.prepare(databaseXAResource)
+- Call: databaseXAResource.prepare(xid)
+- Oracle validates transaction
+- Oracle creates prepared transaction entry
+- Oracle starts 60-second timeout clock
+- Response: XA_OK (vote YES)
+- Duration: 300ms
+```
+
+**T=6s: All Prepares Succeed**
+```
+Both participants voted YES
+- State: Transitions to IN_DOUBT
+- tmlog: Entry UPDATED to IN_DOUBT state
+- Coordinator makes COMMIT decision (irrevocable)
+- This decision is durable (logged)
+```
+
+**tmlog entry at T=6s**:
+```
+{
+  "transactionId": "TX-12345",
+  "state": "IN_DOUBT",
+  "participants": [
+    {"resourceName": "QueueManager", "branch": "XID-Q-12345", "state": "PREPARED"},
+    {"resourceName": "OracleDB", "branch": "XID-DB-12345", "state": "PREPARED"}
+  ],
+  "timestamp": T=6s,
+  "expires": T=36s  // T + 30s timeout
+}
+```
+
+**Oracle internal state at T=6s**:
+```sql
+SELECT local_tran_id, state, fail_time 
+FROM dba_2pc_pending 
+WHERE local_tran_id = 'XID-DB-12345';
+
+-- Result:
+-- local_tran_id: XID-DB-12345
+-- state: prepared
+-- fail_time: T=66s (T + 60s Oracle timeout)
+```
+
+#### Phase 3: Commit Phase Begins (T=6s to T=7s)
+
+**T=6s: Coordinator Transitions to COMMITTING**
+```
+State: IN_DOUBT → COMMITTING
+- tmlog: Entry UPDATED to COMMITTING state
+- Coordinator begins sending commit messages
+```
+
+**tmlog entry at T=6s**:
+```
+{
+  "transactionId": "TX-12345",
+  "state": "COMMITTING",
+  "participants": [
+    {"resourceName": "QueueManager", "branch": "XID-Q-12345", "state": "PREPARED"},
+    {"resourceName": "OracleDB", "branch": "XID-DB-12345", "state": "PREPARED"}
+  ],
+  "timestamp": T=6s,
+  "expires": T=36s
+}
+```
+
+**T=6.5s: Queue Commit Succeeds**
+```
+coordinator.commit(queueXAResource)
+- Call: queueXAResource.commit(xid, false)
+- Queue commits the message
+- Message becomes VISIBLE to consumers
+- Response: SUCCESS
+- Duration: 500ms
+```
+
+**T=7s: Database Commit Fails**
+```
+coordinator.commit(databaseXAResource)
+- Call: databaseXAResource.commit(xid, false)
+- Network timeout / connection failure
+- Oracle does NOT receive commit
+- Response: XAException - connection error
+- Duration: 500ms (timeout waiting for response)
+```
+
+#### Phase 4: Heuristic State (T=7s to T=66s)
+
+**T=7s: Commit Failure Detected**
+```
+TerminationResult detects mixed outcome:
+- Queue: COMMITTED (success)
+- Database: UNKNOWN (failed to commit)
+
+State: COMMITTING → HEUR_HAZARD
+- tmlog: Entry UPDATED to HEUR_HAZARD state
+- Recovery will retry database commit
+```
+
+**tmlog entry at T=7s**:
+```
+{
+  "transactionId": "TX-12345",
+  "state": "HEUR_HAZARD",
+  "participants": [
+    {"resourceName": "QueueManager", "branch": "XID-Q-12345", "state": "COMMITTED"},
+    {"resourceName": "OracleDB", "branch": "XID-DB-12345", "state": "PREPARED", "retry": true}
+  ],
+  "timestamp": T=7s,
+  "expires": T=37s
+}
+```
+
+**Atomikos logs at T=7s**:
+```
+WARN: Transaction TX-12345 entered HEUR_HAZARD state
+INFO: Queue committed successfully
+ERROR: Database commit failed with connection error
+INFO: Will retry database commit during recovery
+```
+
+**T=17s: First Recovery Attempt**
+```
+Recovery service scans tmlog (every 10 seconds)
+- Finds TX-12345 in HEUR_HAZARD state
+- Attempts to retry commit on database
+- Call: databaseXAResource.commit(xid, false)
+- Still cannot connect / times out
+- Response: XAException - connection error
+- State: Remains HEUR_HAZARD
+```
+
+**T=27s: Second Recovery Attempt**
+```
+Recovery service scans again
+- Finds TX-12345 still in HEUR_HAZARD
+- Attempts to retry commit on database
+- Call: databaseXAResource.commit(xid, false)
+- Still cannot connect / times out
+- Response: XAException - connection error
+- State: Remains HEUR_HAZARD
+```
+
+**T=37s: Third Recovery Attempt**
+```
+Recovery service scans again
+- Finds TX-12345 still in HEUR_HAZARD
+- NOTE: Transaction has now exceeded its original 30s timeout
+- But it's in HEUR_HAZARD (recoverable), so it continues
+- Attempts to retry commit on database
+- Call: databaseXAResource.commit(xid, false)
+- Still cannot connect / times out
+- Response: XAException - connection error
+- State: Remains HEUR_HAZARD
+```
+
+**T=47s: Fourth Recovery Attempt**
+```
+Recovery service scans again
+- Attempts retry
+- Still fails
+- State: Remains HEUR_HAZARD
+```
+
+**T=57s: Fifth Recovery Attempt**
+```
+Recovery service scans again
+- Attempts retry
+- Still fails
+- State: Remains HEUR_HAZARD
+```
+
+#### Phase 5: Oracle Timeout (T=66s)
+
+**T=66s: Oracle's distributed_lock_timeout Expires**
+```
+Oracle's 60-second timeout (started at T=6s) has expired
+
+Oracle automatically performs:
+- Rollback of prepared transaction XID-DB-12345
+- Cleanup of undo tablespace entries
+- Removal from dba_2pc_pending
+- Record is NOT inserted into database
+```
+
+**Oracle logs at T=66s**:
+```
+ORA-02051: timeout waiting for transaction coordinator
+Rolling back distributed transaction: XID-DB-12345
+```
+
+**Oracle state after T=66s**:
+```sql
+SELECT local_tran_id, state FROM dba_2pc_pending 
+WHERE local_tran_id = 'XID-DB-12345';
+
+-- Result: No rows (transaction has been cleaned up)
+```
+
+**Atomikos state at T=66s**:
+```
+Transaction TX-12345 still in HEUR_HAZARD
+- Atomikos doesn't know Oracle rolled back
+- tmlog still shows database as PREPARED (retry: true)
+- Recovery will continue attempting to commit
+```
+
+#### Phase 6: Atomikos Discovers Oracle Rollback (T=67s)
+
+**T=67s: Sixth Recovery Attempt**
+```
+Recovery service scans again
+- Attempts to retry commit on database
+- Call: databaseXAResource.commit(xid, false)
+- Oracle responds: XA_NOTA (transaction not found)
+- Atomikos realizes the prepared transaction is gone
+
+Analysis by Atomikos:
+- Queue: COMMITTED
+- Database: Transaction not found (likely rolled back)
+- This is a HEUR_MIXED outcome
+
+State: HEUR_HAZARD → HEUR_MIXED
+- tmlog: Entry UPDATED to HEUR_MIXED state
+```
+
+**tmlog entry at T=67s**:
+```
+{
+  "transactionId": "TX-12345",
+  "state": "HEUR_MIXED",
+  "participants": [
+    {"resourceName": "QueueManager", "branch": "XID-Q-12345", "state": "COMMITTED"},
+    {"resourceName": "OracleDB", "branch": "XID-DB-12345", "state": "ROLLED_BACK"}
+  ],
+  "timestamp": T=67s,
+  "expires": T=97s  // Still using original timeout
+}
+```
+
+**Atomikos logs at T=67s**:
+```
+ERROR: Transaction TX-12345 transitioned to HEUR_MIXED state
+ERROR: Queue committed successfully
+ERROR: Database transaction not found (XA_NOTA) - likely rolled back by resource manager
+WARN: Data inconsistency detected - manual intervention required
+WARN: Transaction will remain in HEUR_MIXED state until administratively resolved
+```
+
+#### Phase 7: Long-term State (T=67s to T=306s)
+
+**T=77s, T=87s, T=97s, etc.: Continued Recovery Attempts**
+```
+Recovery service continues scanning
+- Finds TX-12345 in HEUR_MIXED state
+- HeurMixedStateHandler is invoked
+- No retry possible (outcome is final)
+- State: Remains HEUR_MIXED
+- Transaction stays in this state
+```
+
+**T=306s: max_timeout (5 minutes) Exceeded**
+```
+Transaction has been running for 306 seconds (5 minutes 6 seconds)
+This exceeds max_timeout of 300 seconds
+
+Atomikos coordinator decides:
+- Transaction has exceeded maximum timeout
+- Even in HEUR_MIXED state, it must be abandoned
+
+State: HEUR_MIXED → ABANDONED
+- Coordinator is disposed
+- Resources are released
+- tmlog: NO UPDATE (ABANDONED is not logged)
+```
+
+**Atomikos logs at T=306s**:
+```
+WARN: Abandoning TX-12345 in state HEUR_MIXED after timeout
+INFO: Recovery will cleanup in the background
+```
+
+**tmlog entry at T=306s**:
+```
+Still shows HEUR_MIXED from T=67s:
+{
+  "transactionId": "TX-12345",
+  "state": "HEUR_MIXED",  // Last logged state
+  "participants": [...],
+  "timestamp": T=67s,
+  "expires": T=97s  // This timestamp has passed
+}
+```
+
+#### Phase 8: tmlog Cleanup (T=306s to T=86497s / 24 hours later)
+
+**T=306s to T=86497s: Orphaned Entry**
+```
+The tmlog entry remains as "orphaned":
+- Transaction is ABANDONED in memory (disposed)
+- tmlog still has HEUR_MIXED entry
+- Entry is expired (current time > expires timestamp)
+- Waiting for cleanup
+```
+
+**T=86497s (24 hours after entry.expires): Cleanup**
+```
+Calculation:
+- entry.expires = T=97s
+- forget_orphaned_log_entries_delay = 86,400 seconds (24 hours)
+- Cleanup time = 97 + 86,400 = 86,497 seconds
+
+CachedRepository cleanup runs:
+- Checks: current_time (86,497s) > entry.expires (97s) + delay (86,400s)?
+- Result: YES (86,497 > 86,497)
+- Action: REMOVE entry from tmlog
+
+tmlog: Entry for TX-12345 is permanently deleted
+```
+
+**Atomikos logs at T=86497s**:
+```
+INFO: Removing orphaned transaction log entry: TX-12345
+INFO: Transaction was in state HEUR_MIXED before cleanup
+```
+
+### Summary of States
+
+| Time | Atomikos State | tmlog Entry | Oracle State | Queue State |
+|------|---------------|-------------|--------------|-------------|
+| T=0s | ACTIVE | None | N/A | N/A |
+| T=5s | PREPARING | PREPARING | N/A | N/A |
+| T=6s | IN_DOUBT | IN_DOUBT | prepared | prepared |
+| T=6s | COMMITTING | COMMITTING | prepared | prepared |
+| T=7s | HEUR_HAZARD | HEUR_HAZARD | prepared | committed |
+| T=66s | HEUR_HAZARD | HEUR_HAZARD | rolled back | committed |
+| T=67s | HEUR_MIXED | HEUR_MIXED | N/A | committed |
+| T=306s | ABANDONED | HEUR_MIXED (orphaned) | N/A | committed |
+| T=86497s | N/A | Deleted | N/A | committed |
+
+### Key Observations
+
+#### 1. Final Result
+
+**What the user sees**:
+- **Queue message**: VISIBLE (committed at T=6.5s)
+- **Database record**: MISSING (never committed, rolled back at T=66s)
+- **Data inconsistency**: Queue and database are out of sync
+
+**Why this happened**:
+- Both resources prepared successfully
+- Queue committed before database
+- Database commit failed (network/connection issue)
+- Before Atomikos could retry, Oracle timed out and rolled back
+- Atomikos discovered the rollback only on next retry attempt
+
+#### 2. tmlog Status Throughout
+
+**Logged states** (in order):
+1. PREPARING (T=5s)
+2. IN_DOUBT (T=6s)
+3. COMMITTING (T=6s)
+4. HEUR_HAZARD (T=7s) ← Stays until T=67s
+5. HEUR_MIXED (T=67s) ← Stays until cleanup
+
+**NOT logged states**:
+- ACTIVE (not recoverable)
+- ABANDONED (not recoverable, only in memory at T=306s)
+
+**Final cleanup**:
+- Entry remains in tmlog until T=86497s (24 hours after expires)
+- Then permanently deleted by `forget_orphaned_log_entries_delay` mechanism
+
+#### 3. Which Timeout Clears the Transaction?
+
+**From tmlog**:
+- `forget_orphaned_log_entries_delay` (24 hours after expiry)
+- This is the ONLY timeout that removes entries from tmlog
+- Triggered at T=86497s (entry.expires + 24 hours)
+
+**From memory (coordinator disposal)**:
+- `max_timeout` (5 minutes) causes ABANDONED at T=306s
+- But this doesn't remove from tmlog, just disposes the coordinator
+
+#### 4. Critical Timing Issues
+
+**Problem 1: Oracle timeout < Recovery retry window**
+- Oracle timeout: 60 seconds
+- Atomikos retries: Every 10 seconds
+- Gap between retries: Up to 10 seconds
+- Oracle can timeout and rollback between retry attempts
+
+**Problem 2: No immediate detection of Oracle rollback**
+- Atomikos only discovers rollback on next retry (T=67s)
+- 1-second delay between Oracle rollback (T=66s) and discovery
+- During this window, Atomikos believes database is still prepared
+
+**Problem 3: HEUR_MIXED persists for 24 hours**
+- Even after ABANDONED (T=306s), tmlog keeps HEUR_MIXED entry
+- Administrators see this entry for 24 hours
+- Can cause confusion about transaction status
+
+### Prevention Strategies
+
+**1. Align Timeouts Properly**
+```properties
+# Ensure Oracle timeout > Atomikos max_timeout
+# Atomikos
+com.atomikos.icatch.max_timeout=300000  # 5 minutes
+
+# Oracle
+distributed_lock_timeout=360  # 6 minutes (20% buffer)
+```
+
+**2. Use Single-Threaded 2PC**
+```properties
+# Ensures consistent commit order (database before queue)
+com.atomikos.icatch.single_threaded_2pc=true
+```
+
+**3. Implement Idempotent Consumers**
+```java
+// Queue consumer checks database before processing
+public void onMessage(Message msg) {
+    String recordId = msg.getStringProperty("recordId");
+    if (database.recordExists(recordId)) {
+        // Record exists, skip processing
+        return;
+    }
+    // Record missing, log inconsistency
+    logger.error("Orphaned queue message: " + recordId);
+    // Handle according to business rules
+}
+```
+
+**4. Monitor HEUR_MIXED Transactions**
+```java
+// Alert on heuristic states
+if (transactionState == HEUR_MIXED) {
+    alerting.send("Data inconsistency detected: " + txId);
+    // Manual intervention required
+}
+```
+
+**5. Reduce Commit Phase Latency**
+- Use connection pooling to avoid connection setup time
+- Monitor network latency between Atomikos and resources
+- Place transaction manager close to resources (same datacenter)
+- Consider using local transactions when possible
+
+### Conclusion
+
+This simulation demonstrates the exact scenario where:
+1. Both prepare succeed → IN_DOUBT logged
+2. Queue commits successfully → message visible
+3. Database commit fails → HEUR_HAZARD logged
+4. Oracle times out prepared transaction → database rolls back
+5. Atomikos discovers rollback → HEUR_MIXED logged
+6. Transaction exceeds max_timeout → ABANDONED (memory only)
+7. After 24 hours → tmlog entry deleted
+
+The result is a **permanent data inconsistency** between queue and database, with the transaction eventually cleaned from tmlog by the `forget_orphaned_log_entries_delay` timeout (24 hours after the transaction's expiry timestamp).
