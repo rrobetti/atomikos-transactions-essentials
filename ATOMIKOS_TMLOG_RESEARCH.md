@@ -1398,8 +1398,8 @@ Evidence to look for:
 ```
 If the XA connection/session was terminated:
 - Oracle may have rolled back the prepared transaction
-- Check parameter: distributed_transaction_timeout (different from distributed_lock_timeout)
-- This parameter CAN affect prepared transactions in some Oracle versions
+- Session termination can trigger automatic cleanup
+- This depends on Oracle version and configuration
 ```
 
 **Explanation 4: Network Partition with Timeout**
@@ -1683,11 +1683,12 @@ Example:
   * Commit/rollback received
   * Manual DBA intervention
   * Instance restart
-  * Other Oracle-level timeout (e.g., distributed_transaction_timeout if configured)
+  * Session/connection termination (depending on Oracle configuration)
 - In this case, the prepared transaction disappeared, but not due to distributed_lock_timeout
 
-**Problem 4: No way for Oracle to automatically timeout**
-- Without automatic timeout, orphaned prepared transactions accumulate
+**Problem 4: No automatic timeout for prepared transactions**
+- Oracle has no standard timeout parameter for prepared transactions
+- Orphaned prepared transactions accumulate without manual intervention
 - Requires manual monitoring and cleanup
 - DBA must periodically check dba_2pc_pending
 
@@ -1714,16 +1715,32 @@ com.atomikos.icatch.max_timeout=300000           # 5 minutes for recovery window
 # This gives recovery adequate time to retry before abandoning
 ```
 
-**3. Configure Oracle Transaction Timeout**
-```properties
-# Oracle parameter that CAN affect prepared transactions (unlike distributed_lock_timeout)
-# In Oracle (as DBA):
-ALTER SYSTEM SET distributed_transaction_timeout = 7200 SCOPE=BOTH;  -- 2 hours
+**3. Monitor and Manually Clean Prepared Transactions**
+```sql
+-- Oracle has no automatic timeout for prepared transactions
+-- Set up regular monitoring and manual cleanup process
 
-# This provides a safety net for truly orphaned prepared transactions
+-- Monitor prepared transactions
+SELECT local_tran_id, state, fail_time,
+       SYSDATE - fail_time AS hours_stuck
+FROM dba_2pc_pending
+WHERE state = 'prepared';
+
+-- Manual cleanup when needed (as DBA)
+-- Use with caution - only for truly orphaned transactions
+ROLLBACK FORCE 'transaction_id';
+-- OR
+EXECUTE DBMS_TRANSACTION.PURGE_LOST_DB_ENTRY('transaction_id');
 ```
 
-**4. Monitor Prepared Transactions**
+**4. Set Application-Level XA Timeout**
+```java
+// Atomikos can set XA timeout via XAResource.setTransactionTimeout()
+// This tells Oracle how long to wait, but enforcement varies by Oracle version
+// Configure via com.atomikos.icatch.default_jta_timeout
+```
+
+**5. Monitor Prepared Transactions Regularly**
 ```sql
 -- Regular monitoring query for Oracle DBA
 SELECT local_tran_id, state, fail_time, commit#,
@@ -1733,7 +1750,7 @@ WHERE state = 'prepared'
 AND fail_time < SYSDATE - 1/24;  -- Alert if stuck > 1 hour
 ```
 
-**5. Implement Idempotent Consumers**
+**6. Implement Idempotent Consumers**
 ```java
 // Queue consumer checks database before processing
 public void onMessage(Message msg) {
@@ -1748,13 +1765,13 @@ public void onMessage(Message msg) {
 }
 ```
 
-**6. Use Single-Threaded 2PC**
+**7. Use Single-Threaded 2PC**
 ```properties
 # Ensures database commits before queue
 com.atomikos.icatch.single_threaded_2pc=true
 ```
 
-**7. Monitor Heuristic States**
+**8. Monitor Heuristic States**
 ```java
 // Alert on heuristic states
 if (transactionState == HEUR_MIXED || transactionState == HEUR_HAZARD) {
@@ -1806,7 +1823,7 @@ This simulation demonstrates the actual scenario with production configuration:
 **A1**: Most likely causes:
 - Manual DBA intervention (purge_lost_db_entry or ROLLBACK FORCE)
 - Oracle instance restart/crash
-- Configured distributed_transaction_timeout (different parameter)
+- Session/connection termination triggering automatic cleanup
 - Extended network partition with heuristic decision
 - NOT distributed_lock_timeout (this only affects active transactions waiting for locks)
 
