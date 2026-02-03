@@ -253,19 +253,44 @@ There is NO automatic timeout mechanism for prepared transactions in Oracle.
 
 #### 2. Oracle XA Transaction Timeout (Set by Atomikos)
 
-**How it works**: Atomikos calls `XAResource.setTransactionTimeout(seconds)` on Oracle XA resources
+**How it works**: Atomikos calls `XAResource.setTransactionTimeout(seconds)` on Oracle XA resources when the resource is first used
 
-**Implementation**: `XAResourceTransaction.java` line 75:
+**Atomikos Implementation** (in this repository):
+
+In `XAResourceTransaction.java`:
 ```java
-this.timeout = transaction.getTimeout() / 1000; // Convert ms to seconds
-xaresource.setTransactionTimeout(this.timeout);
+// Constructor: timeout is derived from the transaction timeout
+this.timeout = (int) transaction.getTimeout() / 1000; // Convert ms to seconds
+
+// Method setXAResource(): called when resource is first used
+public void setXAResource(XAResource xaresource) {
+    this.xaresource = xaresource;
+    try {
+        this.xaresource.setTransactionTimeout(this.timeout);
+    } catch (XAException e) {
+        // Warning logged but not considered fatal
+    }
+}
 ```
+
+**When is it called?**:
+- When the XA resource is first accessed in the transaction (before any work is done)
+- Sets the timeout based on the transaction's configured timeout (`default_jta_timeout`)
+- Called during the **ACTIVE** phase, before any prepare() calls
 
 **What it does**:
 - Sets timeout for **active transaction operations** (before prepare)
+- Tells Oracle's XA driver how long to wait for operations during the active phase
 - **Does NOT reliably timeout prepared transactions** in Oracle
 - Oracle prepared transactions persist indefinitely regardless of this setting
-- This timeout primarily affects operations during the active phase, not the prepared state
+- The timeout value comes from Atomikos transaction timeout, NOT from max_timeout
+
+**Critical Limitation**: 
+Once `xa_prepare()` succeeds and the transaction enters PREPARED state in Oracle, this timeout no longer applies. The prepared transaction will persist indefinitely until:
+1. Commit/rollback is received
+2. Manual DBA intervention (ROLLBACK FORCE)
+3. Oracle instance restart
+4. Session/connection termination (depending on configuration)
 
 ### ABANDONED State
 
