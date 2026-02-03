@@ -1349,28 +1349,28 @@ TerminationResult detects mixed outcome:
 - Queue: COMMITTED (success)
 - Database: UNKNOWN (failed to commit)
 
-State: COMMITTING → HEUR_HAZARD
-- tmlog: Entry UPDATED to HEUR_HAZARD state
-- Recovery will retry database commit
+State: COMMITTING → HEUR_HAZARD (in-memory only)
+- tmlog: Entry REMAINS in COMMITTING state (NOT updated to HEUR_HAZARD)
+- Recovery will retry database commit from COMMITTING state
 ```
 
-**tmlog entry at T=7s**:
+**tmlog entry at T=7s** (UNCHANGED - remains COMMITTING):
 ```
 {
   "transactionId": "TX-12345",
-  "state": "HEUR_HAZARD",
+  "state": "COMMITTING",
   "participants": [
     {"resourceName": "QueueManager", "branch": "XID-Q-12345", "state": "COMMITTED"},
     {"resourceName": "OracleDB", "branch": "XID-DB-12345", "state": "PREPARED", "retry": true}
   ],
-  "timestamp": T=7s,
-  "expires": T=47s
+  "timestamp": T=6s,
+  "expires": T=46s
 }
 ```
 
 **Atomikos logs at T=7s**:
 ```
-WARN: Transaction TX-12345 entered HEUR_HAZARD state
+WARN: Transaction TX-12345 entered HEUR_HAZARD state (in-memory only)
 INFO: Queue committed successfully
 ERROR: Database commit failed with connection error
 INFO: Will retry database commit during recovery
@@ -1382,7 +1382,8 @@ Recovery delay is 60 seconds
 - NO recovery attempts happen between T=7s and T=67s
 - Atomikos waits 60 seconds before first recovery scan
 - During this entire period:
-  * Transaction is in HEUR_HAZARD state
+  * In-memory coordinator is in HEUR_HAZARD state
+  * tmlog entry remains in COMMITTING state
   * Oracle has prepared transaction (state: prepared)
   * Queue message is visible (already committed)
   * Database connection issue persists
@@ -1406,7 +1407,8 @@ WHERE local_tran_id = 'XID-DB-12345';
 ```
 Transaction has been running for 40 seconds
 - Original timeout (default_jta_timeout = 40s) has expired
-- But transaction is in HEUR_HAZARD (recoverable state)
+- Coordinator is in HEUR_HAZARD state in-memory
+- tmlog entry remains in COMMITTING state (recoverable)
 - Transaction continues, waiting for recovery
 - No action taken at this point
 ```
@@ -1423,7 +1425,8 @@ tmlog entry expires timestamp reached (T=46s)
 **T=67s: FIRST Recovery Attempt**
 ```
 Recovery service scans tmlog (first scan after 60 second delay)
-- Finds TX-12345 in HEUR_HAZARD state
+- Finds TX-12345 in COMMITTING state (tmlog)
+- In-memory coordinator is in HEUR_HAZARD state
 - Transaction has exceeded both timeouts (40s transaction, 46s expires)
 - But max_timeout (40s) has been exceeded at T=40s
 - Attempts to retry commit on database
@@ -1611,40 +1614,41 @@ Analysis by Atomikos:
 - Database: Transaction not found (was rolled back somehow)
 - This is a HEUR_MIXED outcome
 
-State: HEUR_HAZARD → HEUR_MIXED
-- tmlog: Entry UPDATED to HEUR_MIXED state
+State: HEUR_HAZARD → HEUR_MIXED (in-memory only)
+- tmlog: Entry REMAINS in COMMITTING state (NOT updated to HEUR_MIXED)
 ```
 
-**tmlog entry when HEUR_MIXED detected**:
+**tmlog entry when HEUR_MIXED detected** (UNCHANGED - still COMMITTING):
 ```
 {
   "transactionId": "TX-12345",
-  "state": "HEUR_MIXED",
+  "state": "COMMITTING",
   "participants": [
     {"resourceName": "QueueManager", "branch": "XID-Q-12345", "state": "COMMITTED"},
-    {"resourceName": "OracleDB", "branch": "XID-DB-12345", "state": "ROLLED_BACK"}
+    {"resourceName": "OracleDB", "branch": "XID-DB-12345", "state": "PREPARED", "retry": true}
   ],
-  "timestamp": <when_discovered>,
-  "expires": <timestamp + 40s>
+  "timestamp": T=6s,
+  "expires": T=46s
 }
 ```
 
 **Atomikos logs**:
 ```
-ERROR: Transaction TX-12345 transitioned to HEUR_MIXED state
+ERROR: Transaction TX-12345 transitioned to HEUR_MIXED state (in-memory only)
 ERROR: Queue committed successfully
 ERROR: Database transaction not found (XA_NOTA) - likely rolled back by resource manager
 WARN: Data inconsistency detected - manual intervention required
-WARN: Transaction will remain in HEUR_MIXED state until administratively resolved
+WARN: Coordinator in HEUR_MIXED state, tmlog remains COMMITTING
 ```
 
 **Long-term State**:
 ```
-Transaction remains in HEUR_MIXED state
+Coordinator in HEUR_MIXED state (in-memory), tmlog shows COMMITTING
 - Recovery service continues scanning every 60 seconds
-- Finds TX-12345 in HEUR_MIXED state
-- HeurMixedStateHandler is invoked
-- No retry possible (outcome is final)
+- Finds TX-12345 in COMMITTING state in tmlog
+- Coordinator has HEUR_MIXED state in-memory
+- Recovery may continue retry attempts based on tmlog COMMITTING state
+- No automatic resolution possible (outcome is final)
 - State: Remains HEUR_MIXED
 - Transaction stays in this state indefinitely or until max_timeout
 ```
@@ -1674,20 +1678,20 @@ Example:
 
 ### Summary of States
 
-| Time | Atomikos State | tmlog Entry | Oracle State | Queue State | Notes |
-|------|---------------|-------------|--------------|-------------|-------|
+| Time | Atomikos State (in-memory) | tmlog Entry | Oracle State | Queue State | Notes |
+|------|---------------------------|-------------|--------------|-------------|-------|
 | T=0s | ACTIVE | None | N/A | N/A | Transaction begins |
 | T=5s | PREPARING | PREPARING | N/A | N/A | commit() called |
 | T=6s | IN_DOUBT | IN_DOUBT | prepared | prepared | Both prepare YES |
 | T=6s | COMMITTING | COMMITTING | prepared | prepared | Commit phase starts |
 | T=6.5s | COMMITTING | COMMITTING | prepared | committed | Queue commits |
-| T=7s | HEUR_HAZARD | HEUR_HAZARD | prepared | committed | DB commit fails |
-| T=7s-67s | HEUR_HAZARD | HEUR_HAZARD | prepared (?) | committed | 60s recovery delay - NO retries |
-| T=40s | HEUR_HAZARD | HEUR_HAZARD | prepared (?) | committed | Transaction timeout exceeded |
-| T=46s | HEUR_HAZARD | HEUR_HAZARD (expired) | prepared (?) | committed | tmlog entry expired |
-| T=?s | HEUR_HAZARD | HEUR_HAZARD (expired) | GONE | committed | Oracle TX disappeared (unknown cause) |
-| T=67s+ | HEUR_HAZARD or HEUR_MIXED | HEUR_MIXED | N/A | committed | Discovery of missing TX |
-| Later | ABANDONED | HEUR_MIXED (orphaned) | N/A | committed | Coordinator disposed |
+| T=7s | HEUR_HAZARD | COMMITTING | prepared | committed | DB commit fails (in-memory only) |
+| T=7s-67s | HEUR_HAZARD | COMMITTING | prepared (?) | committed | 60s recovery delay - NO retries |
+| T=40s | HEUR_HAZARD | COMMITTING | prepared (?) | committed | Transaction timeout exceeded |
+| T=46s | HEUR_HAZARD | COMMITTING (expired) | prepared (?) | committed | tmlog entry expired |
+| T=?s | HEUR_HAZARD | COMMITTING (expired) | GONE | committed | Oracle TX disappeared (unknown cause) |
+| T=67s+ | HEUR_HAZARD or HEUR_MIXED | COMMITTING (expired) | N/A | committed | Discovery of missing TX (in-memory only) |
+| Later | ABANDONED | COMMITTING (orphaned) | N/A | committed | Coordinator disposed (in-memory) |
 | T+24h | N/A | Deleted | N/A | committed | tmlog cleanup |
 
 **Note**: The exact time when Oracle's prepared transaction disappeared is unknown. It could be anytime between T=7s and whenever it was discovered.
@@ -1714,13 +1718,17 @@ Example:
 **Logged states** (in order):
 1. PREPARING (T=5s)
 2. IN_DOUBT (T=6s)
-3. COMMITTING (T=6s)
-4. HEUR_HAZARD (T=7s) ← Stays until HEUR_MIXED discovered
-5. HEUR_MIXED (when discovered) ← Stays until cleanup
+3. COMMITTING (T=6s) ← **Remains COMMITTING throughout** (never changes to heuristic states)
+
+**In-memory coordinator states** (NOT logged to tmlog):
+- HEUR_HAZARD (T=7s onwards, in-memory only)
+- HEUR_MIXED (when discovered, in-memory only)
+- ABANDONED (after max_timeout, in-memory only)
 
 **NOT logged states**:
 - ACTIVE (not recoverable)
 - ABANDONED (not recoverable, only in memory)
+- **HEUR_HAZARD, HEUR_MIXED, HEUR_COMMITTED, HEUR_ABORTED** (not recoverable, only in memory)
 
 **Final cleanup**:
 - Entry expires at: timestamp + 40s
@@ -1866,14 +1874,14 @@ This simulation demonstrates the actual scenario with production configuration:
 **Timeline**:
 1. Both prepare succeed → IN_DOUBT logged at T=6s
 2. Queue commits successfully → message visible at T=6.5s
-3. Database commit fails → HEUR_HAZARD logged at T=7s
+3. Database commit fails → COMMITTING logged, HEUR_HAZARD in-memory at T=7s
 4. **60-second recovery delay** → NO retry attempts from T=7s to T=67s
-5. Transaction timeout expires at T=40s (no action, still in HEUR_HAZARD)
-6. tmlog entry expires at T=46s
+5. Transaction timeout expires at T=40s (no action, HEUR_HAZARD in-memory, COMMITTING in tmlog)
+6. tmlog entry expires at T=46s (still COMMITTING in tmlog)
 7. First recovery attempt at T=67s (27 seconds after timeout)
 8. Oracle prepared transaction disappears (cause unknown - not due to distributed_lock_timeout)
-9. When discovered → HEUR_MIXED logged
-10. Eventually ABANDONED in memory, tmlog cleaned after 24 hours
+9. When discovered → HEUR_MIXED in-memory (tmlog remains COMMITTING)
+10. Eventually ABANDONED in memory, tmlog entry (COMMITTING) cleaned after 24 hours
 
 **Critical Issues Identified**:
 
