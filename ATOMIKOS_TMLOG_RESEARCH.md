@@ -235,19 +235,21 @@ WHERE name = 'distributed_lock_timeout';
 
 **How to change**:
 ```sql
+```sql
+-- In Oracle (as DBA):
 ALTER SYSTEM SET distributed_lock_timeout = 120 SCOPE=BOTH;
 ```
 
-**Critical Configuration Rule**:
+**CRITICAL CLARIFICATION**:
 ```
-Oracle distributed_lock_timeout SHOULD BE > Atomikos max_timeout
+distributed_lock_timeout ONLY affects ACTIVE transactions waiting for locks.
+It does NOT affect PREPARED transactions.
 
-Example:
-  Atomikos max_timeout = 300 seconds (5 minutes)
-  Oracle distributed_lock_timeout = 360 seconds (6 minutes)
+Prepared transactions in Oracle persist indefinitely regardless of this setting.
+There is NO automatic timeout mechanism for prepared transactions in Oracle.
 ```
 
-If Oracle timeout < Atomikos timeout, Oracle may rollback prepared transactions before Atomikos can commit them, causing HEUR_MIXED outcomes.
+**Implication**: Since Oracle doesn't automatically timeout prepared transactions, misalignment with Atomikos timeouts is less of an issue than previously thought. However, manual monitoring and cleanup of orphaned prepared transactions becomes essential.
 
 #### 2. Oracle XA Transaction Timeout (Set by Atomikos)
 
@@ -260,8 +262,10 @@ xaresource.setTransactionTimeout(this.timeout);
 ```
 
 **What it does**:
-- Tells Oracle how long to wait for commit/rollback after prepare
-- If commit doesn't arrive within this time, Oracle may heuristically rollback
+- Sets timeout for **active transaction operations** (before prepare)
+- **Does NOT reliably timeout prepared transactions** in Oracle
+- Oracle prepared transactions persist indefinitely regardless of this setting
+- This timeout primarily affects operations during the active phase, not the prepared state
 
 ### ABANDONED State
 
@@ -957,37 +961,40 @@ com.atomikos.icatch.default_jta_timeout=10000    # 10 seconds
 com.atomikos.icatch.max_timeout=300000            # 5 minutes
 ```
 
-This timeout is set on XA resources via `XAResource.setTransactionTimeout()`.
+This timeout is set on XA resources via `XAResource.setTransactionTimeout()`, but primarily affects **active transaction operations**, not prepared transactions.
 
 #### Oracle XA Transaction Timeout
 
-Oracle has its own timeout for prepared transactions:
+**CRITICAL**: Oracle has **NO standard automatic timeout for prepared transactions**:
 ```sql
--- Default is 60 seconds
-distributed_lock_timeout = 60
+-- distributed_lock_timeout only affects ACTIVE transactions waiting for locks
+-- It does NOT affect PREPARED transactions
+distributed_lock_timeout = 60  -- Does NOT timeout prepared TXs
 
--- If Atomikos timeout (10s) < Oracle timeout (60s)
--- Oracle will keep the prepared TX for up to 60 seconds
--- If commit doesn't arrive within 60s, Oracle may rollback
+-- Prepared transactions persist indefinitely until:
+-- 1. Commit/rollback received
+-- 2. Manual DBA intervention (ROLLBACK FORCE)
+-- 3. Instance restart
+-- 4. Session/connection termination (depending on configuration)
 ```
 
-#### The Timing Problem
+#### Why Prepared Transactions Might Disappear
 
-If there's a delay between prepare and commit:
-```
-T=0s:    Application starts transaction
-T=5s:    commit() called
-T=5.5s:  Prepare phase completes (both YES)
-T=5.5s:  IN_DOUBT state, tmlog written
-T=5.5s:  Atomikos tries to send commit messages
-         -- DELAY HAPPENS HERE --
-T=65s:   Oracle timeout (60s) expires
-T=65s:   Oracle rolls back prepared transaction
-T=70s:   Atomikos commit finally reaches resources
-T=70s:   Queue commits successfully (message visible)
-T=70s:   Database commit fails (transaction not found)
-T=70s:   HEUR_MIXED state
-```
+Since Oracle doesn't automatically timeout prepared transactions, if one disappears, it's due to:
+
+1. **Manual DBA Intervention**: Most common cause
+   ```sql
+   -- DBA manually cleans up orphaned prepared transaction
+   ROLLBACK FORCE 'transaction_id';
+   -- OR
+   EXECUTE DBMS_TRANSACTION.PURGE_LOST_DB_ENTRY('transaction_id');
+   ```
+
+2. **Instance Restart/Crash**: Prepared transactions may require manual resolution after restart
+
+3. **Session Termination**: If the session/connection that created the prepared transaction is terminated, Oracle may clean it up
+
+4. **Heuristic Decision**: In rare cases with extended network partitions, Oracle may make a heuristic decision
 
 ### Diagnostics and Prevention
 
@@ -1733,11 +1740,12 @@ ROLLBACK FORCE 'transaction_id';
 EXECUTE DBMS_TRANSACTION.PURGE_LOST_DB_ENTRY('transaction_id');
 ```
 
-**4. Set Application-Level XA Timeout**
+**4. Set Application-Level XA Timeout (Active Phase Only)**
 ```java
-// Atomikos can set XA timeout via XAResource.setTransactionTimeout()
-// This tells Oracle how long to wait, but enforcement varies by Oracle version
+// Atomikos sets XA timeout via XAResource.setTransactionTimeout()
+// This affects active transaction operations, NOT prepared transactions
 // Configure via com.atomikos.icatch.default_jta_timeout
+// Do NOT rely on this for prepared transaction timeout
 ```
 
 **5. Monitor Prepared Transactions Regularly**
