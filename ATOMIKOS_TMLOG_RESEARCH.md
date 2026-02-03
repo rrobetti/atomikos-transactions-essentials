@@ -31,70 +31,88 @@ Atomikos uses a transaction log file (tmlog) to ensure ACID properties and enabl
 
 ## When Transactions are Stored to tmlog
 
-Transactions are written to the tmlog when they enter **recoverable states**. This happens through the following process:
+**CRITICAL CORRECTION**: After analyzing the actual source code, only **THREE** states are actually marked as recoverable and logged to tmlog.
 
-1. **Trigger**: When a transaction coordinator transitions to a recoverable state
-2. **States that trigger logging** (from `TxState.java`):
-   - `PREPARING` - Prepare phase in progress
-   - `IN_DOUBT` - Waiting for commit/abort decision (most critical for recovery)
-   - `COMMITTING` - Commit phase in progress
-   - `TERMINATED` - Final state marker (written to update existing entry)
+### Recoverable States (logged to tmlog)
 
-3. **Process Flow**:
+From `TxState.java` (lines 14-32), the **ONLY** states with `recoverableState = true` are:
+
+1. **`TERMINATED`** (true, true) - Final state marker
+2. **`COMMITTING`** (true, false) - Commit phase in progress  
+3. **`IN_DOUBT`** (true, false) - All prepares succeeded, awaiting commit decision
+
+### Additional Filtering (CoordinatorImp.excludedFromLogging)
+
+Even for recoverable states, additional filtering occurs in `CoordinatorImp.java` (lines 620-630):
+
+- **IN_DOUBT is excluded for root transactions** (case 23693) - roots don't log IN_DOUBT state
+- **Empty transactions are excluded** (case 84851) - transactions with no participants aren't logged
+
+### Process Flow
+
    ```
-   Coordinator enters recoverable state
+   Coordinator enters COMMITTING, IN_DOUBT (for subordinates), or TERMINATED state
    → StateRecoveryManagerImp.preEnter() is called
-   → PendingTransactionRecord is created from coordinator state
+   → getPendingTransactionRecord() checks excludedFromLogging()
+   → If not excluded: PendingTransactionRecord is created
    → OltpLogImp.write() persists the record to repository
    ```
 
-4. **Non-recoverable states** (NOT logged):
-   - `ACTIVE` - Transaction is running (not yet prepared)
-   - `MARKED_ABORT` - Rollback-only flag set
-   - `COMMITTED` - Successfully committed (terminal state, no recovery needed)
-   - `ABORTED` - Rolled back (terminal state, no recovery needed)
-   - `ABANDONED` - Timed out without resolution
-   - `ABORTING` - Rollback phase in progress (not recoverable)
-   - **`HEUR_COMMITTED`** - Heuristically committed (NOT logged as new state!)
-   - **`HEUR_ABORTED`** - Heuristically rolled back (NOT logged as new state!)
-   - **`HEUR_MIXED`** - Mixed outcome across participants (NOT logged as new state!)
-   - **`HEUR_HAZARD`** - Uncertain outcome (NOT logged as new state!)
+### Non-recoverable states (NOT logged)
+
+All other states have `recoverableState = false` and are **NEVER** logged:
+   - **`PREPARING`** (false, false) - Prepare phase (NOT recoverable!)
+   - **`ABORTING`** (false, false) - Rollback phase (NOT recoverable!)
+   - **`ACTIVE`** (false, false) - Transaction running
+   - **`MARKED_ABORT`** (false, false) - Rollback-only flag
+   - **`COMMITTED`** (false, false) - Successfully committed  
+   - **`ABORTED`** (false, false) - Rolled back
+   - **`ABANDONED`** (false, false) - Timed out
+   - **`HEUR_COMMITTED`** (false, false) - Heuristic commit
+   - **`HEUR_ABORTED`** (false, false) - Heuristic rollback
+   - **`HEUR_MIXED`** (false, false) - Mixed outcome
+   - **`HEUR_HAZARD`** (false, false) - Uncertain outcome
 
 **Implementation References**:
 - `StateRecoveryManagerImp.java` (lines 34-51)
 - `OltpLogImp.java` (line 48) - Validates recoverable states
 - `TxState.java` (lines 14-44) - Defines which states are recoverable
 
-### Why Heuristic States Are NOT Logged
+### Why Heuristic States and PREPARING/ABORTING Are NOT Logged
 
-**CRITICAL**: When Atomikos transitions to a heuristic state (`HEUR_HAZARD`, `HEUR_MIXED`, `HEUR_COMMITTED`, `HEUR_ABORTED`), it does **NOT** write a new tmlog entry with the heuristic state. This is a deliberate design decision:
+**CRITICAL DESIGN INSIGHT**: 
 
-1. **Heuristic states are NOT recoverable** (defined in `TxState.java` lines 23-27)
+1. **Heuristic states are NOT recoverable** (defined in `TxState.java` lines 23-27):
    ```java
-   HEUR_HAZARD    (false, false, TERMINATED, ABANDONED),
-   HEUR_COMMITTED (false, false, TERMINATED, ABANDONED),
-   HEUR_ABORTED   (false, false, TERMINATED, ABANDONED),
-   HEUR_MIXED     (false, false, TERMINATED, ABANDONED),
+   HEUR_HAZARD    (false, false, TERMINATED, ABANDONED),  // NOT recoverable!
+   HEUR_COMMITTED (false, false, TERMINATED, ABANDONED),  // NOT recoverable!
+   HEUR_ABORTED   (false, false, TERMINATED, ABANDONED),  // NOT recoverable!
+   HEUR_MIXED     (false, false, TERMINATED, ABANDONED),  // NOT recoverable!
    ```
-   The first parameter `false` means `recoverableState = false`.
 
-2. **Why this design?**
-   - Heuristic states indicate **permanent inconsistency** that requires manual intervention
-   - Atomikos keeps retrying from the **previous recoverable state** (`COMMITTING`)
-   - The tmlog entry remains in `COMMITTING` state, allowing recovery retries to continue
-   - Only when all participants eventually succeed (or ABANDONED timeout is reached) does the state change to `TERMINATED`
+2. **PREPARING and ABORTING are also NOT recoverable**:
+   ```java
+   PREPARING      (false, false, IN_DOUBT, ABORTING, TERMINATED, ABANDONED),  // NOT recoverable!
+   ABORTING       (false, false, HEUR_ABORTED, HEUR_COMMITTED, HEUR_HAZARD, HEUR_MIXED, TERMINATED, ABANDONED),  // NOT recoverable!
+   ```
 
-3. **What you'll see in tmlog**:
-   - If commit fails with heuristic exception: tmlog shows **`COMMITTING`** (not `HEUR_HAZARD` or `HEUR_MIXED`)
+3. **Why this design?**
+   - **PREPARING**: If system crashes during prepare, transaction rolls back automatically on recovery (never committed)
+   - **ABORTING**: Rollback doesn't need recovery - if it fails, outcome is acceptable (transaction is already rolling back)
+   - **Heuristic states**: Indicate outcomes that **cannot be automatically recovered** - require manual intervention
+   - **COMMITTING remains logged**: Allows recovery to continue retrying commit operations indefinitely
+
+4. **What you'll see in tmlog during heuristic situations**:
+   - If commit fails with heuristic exception: tmlog shows **`COMMITTING`** (NOT `HEUR_HAZARD` or `HEUR_MIXED`)
    - The heuristic state exists **in-memory only** in the coordinator
-   - Recovery scans continue retrying from `COMMITTING` state
-   - Only when retry succeeds or transaction is abandoned will tmlog be updated
+   - Recovery scans continue retrying from `COMMITTING` state  
+   - Only when retry succeeds or transaction times out (ABANDONED) will tmlog be updated to `TERMINATED`
 
-4. **How to observe heuristic states**:
-   - Check **application logs** for `HeurHazardException` or `HeurMixedException`
+5. **How to observe heuristic states**:
+   - Check **application logs** for `HeurHazardException` or `HeurMixedException`  
    - Monitor **coordinator in-memory state** (if accessible via JMX/debugging)
    - Check for **continuous retry attempts** in recovery logs
-   - The tmlog will show `COMMITTING` until resolved or abandoned
+   - The tmlog will persistently show `COMMITTING` until resolved or abandoned
 
 **Example Scenario**:
 ```
@@ -523,14 +541,14 @@ stateDiagram-v2
     [*] --> ACTIVE: Transaction begins
     
     note right of ACTIVE
-        Not logged to tmlog
+        NOT logged to tmlog
         Transaction is executing
     end note
     
     ACTIVE --> PREPARING: commit() called
     
     note right of PREPARING
-        ✓ LOGGED to tmlog
+        NOT logged to tmlog
         Coordinator sends prepare()
         to all participants
     end note
@@ -539,7 +557,7 @@ stateDiagram-v2
     
     note right of IN_DOUBT
         ✓ LOGGED to tmlog
-        Critical recovery state
+        (subordinates only, not roots)
         All participants are prepared
         Awaiting final decision
     end note
@@ -571,11 +589,11 @@ stateDiagram-v2
 
 ### Detailed Flow for Successful Transaction:
 
-1. **ACTIVE** (not logged): Transaction starts, application executes business logic
-2. **PREPARING** (logged): 
+1. **ACTIVE** (NOT logged): Transaction starts, application executes business logic
+2. **PREPARING** (NOT logged): 
    - Transaction manager calls `prepare()` on Database participant → Vote: YES
    - Transaction manager calls `prepare()` on Queue Manager participant → Vote: YES
-3. **IN_DOUBT** (logged): 
+3. **IN_DOUBT** (logged for subordinates, NOT for root transactions): 
    - All participants voted YES
    - Coordinator makes COMMIT decision
    - Critical state: if crash occurs here, recovery will commit
