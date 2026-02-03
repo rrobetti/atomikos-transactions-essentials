@@ -34,15 +34,11 @@ Atomikos uses a transaction log file (tmlog) to ensure ACID properties and enabl
 Transactions are written to the tmlog when they enter **recoverable states**. This happens through the following process:
 
 1. **Trigger**: When a transaction coordinator transitions to a recoverable state
-2. **States that trigger logging**:
+2. **States that trigger logging** (from `TxState.java`):
    - `PREPARING` - Prepare phase in progress
    - `IN_DOUBT` - Waiting for commit/abort decision (most critical for recovery)
    - `COMMITTING` - Commit phase in progress
-   - `ABORTING` - Rollback phase in progress
-   - `HEUR_COMMITTED` - Heuristically committed
-   - `HEUR_ABORTED` - Heuristically rolled back
-   - `HEUR_MIXED` - Mixed outcome across participants
-   - `HEUR_HAZARD` - Uncertain outcome
+   - `TERMINATED` - Final state marker (written to update existing entry)
 
 3. **Process Flow**:
    ```
@@ -58,10 +54,59 @@ Transactions are written to the tmlog when they enter **recoverable states**. Th
    - `COMMITTED` - Successfully committed (terminal state, no recovery needed)
    - `ABORTED` - Rolled back (terminal state, no recovery needed)
    - `ABANDONED` - Timed out without resolution
+   - `ABORTING` - Rollback phase in progress (not recoverable)
+   - **`HEUR_COMMITTED`** - Heuristically committed (NOT logged as new state!)
+   - **`HEUR_ABORTED`** - Heuristically rolled back (NOT logged as new state!)
+   - **`HEUR_MIXED`** - Mixed outcome across participants (NOT logged as new state!)
+   - **`HEUR_HAZARD`** - Uncertain outcome (NOT logged as new state!)
 
 **Implementation References**:
 - `StateRecoveryManagerImp.java` (lines 34-51)
 - `OltpLogImp.java` (line 48) - Validates recoverable states
+- `TxState.java` (lines 14-44) - Defines which states are recoverable
+
+### Why Heuristic States Are NOT Logged
+
+**CRITICAL**: When Atomikos transitions to a heuristic state (`HEUR_HAZARD`, `HEUR_MIXED`, `HEUR_COMMITTED`, `HEUR_ABORTED`), it does **NOT** write a new tmlog entry with the heuristic state. This is a deliberate design decision:
+
+1. **Heuristic states are NOT recoverable** (defined in `TxState.java` lines 23-27)
+   ```java
+   HEUR_HAZARD    (false, false, TERMINATED, ABANDONED),
+   HEUR_COMMITTED (false, false, TERMINATED, ABANDONED),
+   HEUR_ABORTED   (false, false, TERMINATED, ABANDONED),
+   HEUR_MIXED     (false, false, TERMINATED, ABANDONED),
+   ```
+   The first parameter `false` means `recoverableState = false`.
+
+2. **Why this design?**
+   - Heuristic states indicate **permanent inconsistency** that requires manual intervention
+   - Atomikos keeps retrying from the **previous recoverable state** (`COMMITTING`)
+   - The tmlog entry remains in `COMMITTING` state, allowing recovery retries to continue
+   - Only when all participants eventually succeed (or ABANDONED timeout is reached) does the state change to `TERMINATED`
+
+3. **What you'll see in tmlog**:
+   - If commit fails with heuristic exception: tmlog shows **`COMMITTING`** (not `HEUR_HAZARD` or `HEUR_MIXED`)
+   - The heuristic state exists **in-memory only** in the coordinator
+   - Recovery scans continue retrying from `COMMITTING` state
+   - Only when retry succeeds or transaction is abandoned will tmlog be updated
+
+4. **How to observe heuristic states**:
+   - Check **application logs** for `HeurHazardException` or `HeurMixedException`
+   - Monitor **coordinator in-memory state** (if accessible via JMX/debugging)
+   - Check for **continuous retry attempts** in recovery logs
+   - The tmlog will show `COMMITTING` until resolved or abandoned
+
+**Example Scenario**:
+```
+T=6s:  commit() called → tmlog: COMMITTING
+T=7s:  DB commit fails with XAException → in-memory: HEUR_HAZARD
+                                        → tmlog: still COMMITTING (not updated!)
+T=17s: Recovery retry → commit to DB again → fails → still HEUR_HAZARD in-memory
+T=27s: Recovery retry → commit to DB again → fails → still HEUR_HAZARD in-memory
+...continues indefinitely until success or ABANDONED...
+```
+
+**Implementation**: See `StateRecoveryManagerImp.register()` which only registers FSM listeners for recoverable states.
 
 ---
 
