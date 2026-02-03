@@ -402,7 +402,7 @@ However, the transaction may have been logged in a previous recoverable state (P
 
 **The cleanup process**:
 
-1. **Last logged state**: Before ABANDONED, the transaction was in a recoverable state (e.g., IN_DOUBT, HEUR_HAZARD) and was logged to tmlog
+1. **Last logged state**: Before ABANDONED, the transaction was in a recoverable state (e.g., IN_DOUBT, COMMITTING) and was logged to tmlog
 
 2. **Transition to ABANDONED**: When max_timeout is exceeded, the transaction moves to ABANDONED state locally (in memory), but this state change is NOT written to tmlog
 
@@ -668,13 +668,14 @@ stateDiagram-v2
    - `commit()` on Queue Manager → SUCCESS ✓
    - `commit()` on Database → **EXCEPTION** ✗
    - Exception wrapped as `HeurHazardException` (CommitMessage.java, lines 54-67)
-5. **HEUR_HAZARD** (logged):
-   - Transaction enters heuristic hazard state
+5. **HEUR_HAZARD** (in-memory only, NOT logged):
+   - Transaction enters heuristic hazard state in-memory coordinator
+   - **tmlog remains in COMMITTING state** (to enable continued recovery)
    - Queue Manager has committed (cannot be undone)
    - Database outcome is unknown
    - Retry flag is set for recovery attempts
 6. **Recovery Attempts**:
-   - Recovery service periodically scans for expired COMMITTING/HEUR_HAZARD transactions
+   - Recovery service periodically scans for COMMITTING transactions (tmlog state)
    - Attempts to retry commit on Database
    - Three possible outcomes:
      - **Success** → TERMINATED (Database eventually commits)
@@ -771,7 +772,7 @@ Key source files analyzed:
 
 Atomikos' tmlog file is a critical component for ensuring transaction durability and recovery. Key takeaways:
 
-1. **Only recoverable states are logged** (PREPARING, IN_DOUBT, COMMITTING, ABORTING, HEUR_*)
+1. **Only recoverable states are logged** (PREPARING, IN_DOUBT, COMMITTING, ABORTING - **NOT** heuristic states)
 2. **IN_DOUBT state is the most critical** - it represents the point of no return for commit decision
 3. **Recovery is retry-based** - The system attempts to complete the original decision, not reverse it
 4. **Heuristic outcomes are possible** - When participants cannot be reached or fail, manual intervention may be needed
