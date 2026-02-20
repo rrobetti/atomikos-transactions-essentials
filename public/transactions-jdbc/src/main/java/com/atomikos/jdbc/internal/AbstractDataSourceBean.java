@@ -120,6 +120,29 @@ implements DataSource, ConnectionPoolProperties, Referenceable, Serializable, Or
 	}
 
 	/**
+	 * Resizes the pool at runtime by updating both the minimum and maximum pool
+	 * size and immediately triggering pool maintenance. This is the preferred way
+	 * to change pool sizes after initialization, keeping resizing logic in the
+	 * datasource implementation and relying on the pool's getter-based design to
+	 * pick up the new values.
+	 *
+	 * @param minPoolSize The new minimum pool size. Must be at least 0 and at most maxPoolSize.
+	 * @param maxPoolSize The new maximum pool size. Must be greater than 0.
+	 * @throws AtomikosSQLException if the supplied values are invalid.
+	 */
+	public synchronized void resizePool(int minPoolSize, int maxPoolSize) throws AtomikosSQLException {
+		if (maxPoolSize < 1)
+			throwAtomikosSQLException("Property 'maxPoolSize' must be greater than 0, was: " + maxPoolSize);
+		if (minPoolSize < 0 || minPoolSize > maxPoolSize)
+			throwAtomikosSQLException("Property 'minPoolSize' must be at least 0 and at most maxPoolSize (" + maxPoolSize + "), was: " + minPoolSize);
+		this.minPoolSize = minPoolSize;
+		this.maxPoolSize = maxPoolSize;
+		if (connectionPool != null) {
+			connectionPool.performMaintenance();
+		}
+	}
+
+	/**
 	 * Get the maximum amount of time in seconds the pool will block
 	 * waiting for a connection to become available in the pool when it
 	 * is empty. 

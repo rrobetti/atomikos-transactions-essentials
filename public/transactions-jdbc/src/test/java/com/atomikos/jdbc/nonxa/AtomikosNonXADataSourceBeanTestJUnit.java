@@ -186,7 +186,39 @@ public class AtomikosNonXADataSourceBeanTestJUnit extends TestCase
 		assertEquals ( true , ds.getIgnoreJtaTransactions() );
 		assertEquals ( false , ds.getLocalTransactionMode() );
 	}
-	
-	
-	
+
+	public void testResizePool() throws Exception {
+		assertEquals ( 1 , ds.getMinPoolSize() );
+		assertEquals ( 1 , ds.getMaxPoolSize() );
+		ds.resizePool ( 2 , 5 );
+		assertEquals ( 2 , ds.getMinPoolSize() );
+		assertEquals ( 5 , ds.getMaxPoolSize() );
+	}
+
+	public void testResizePoolInvalidMaxPoolSizeThrowsException() throws Exception {
+		try {
+			ds.resizePool ( 0 , 0 );
+			fail ( "resizePool with maxPoolSize=0 should throw" );
+		} catch ( AtomikosSQLException ok ) {
+			assertTrue ( ok.getMessage().contains ( "maxPoolSize" ) );
+		}
+	}
+
+	public void testResizePoolInvalidMinPoolSizeThrowsException() throws Exception {
+		try {
+			ds.resizePool ( 5 , 3 );
+			fail ( "resizePool with minPoolSize > maxPoolSize should throw" );
+		} catch ( AtomikosSQLException ok ) {
+			assertTrue ( ok.getMessage().contains ( "minPoolSize" ) );
+		}
+	}
+
+	public void testResizePoolNegativeMinPoolSizeThrowsException() throws Exception {
+		try {
+			ds.resizePool ( -1 , 3 );
+			fail ( "resizePool with negative minPoolSize should throw" );
+		} catch ( AtomikosSQLException ok ) {
+			assertTrue ( ok.getMessage().contains ( "minPoolSize" ) );
+		}
+	}
 }

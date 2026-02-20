@@ -292,6 +292,18 @@ public abstract class ConnectionPool<ConnectionType> implements XPooledConnectio
 	}
 
 	/**
+	 * Performs pool maintenance on demand: removes connections that exceeded their
+	 * max lifetime, grows the pool if below minPoolSize, and removes idle excess
+	 * connections above minPoolSize. This allows the datasource implementation to
+	 * trigger immediate pool adjustment when pool properties change at runtime.
+	 */
+	public synchronized void performMaintenance() {
+		removeConnectionsThatExceededMaxLifetime();
+		addConnectionsIfMinPoolSizeNotReached();
+		removeIdleConnectionsIfMinPoolSizeExceeded();
+	}
+
+	/**
 	 * Wait until the connection pool contains an available connection or a timeout happens.
 	 * Returns immediately if the pool already contains a connection in state available.
 	 * @throws CreateConnectionException if a timeout happened while waiting for a connection

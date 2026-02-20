@@ -212,6 +212,29 @@ Referenceable, Serializable, OrderedLifecycleComponent {
 		setMinPoolSize ( minAndMaxSize );
 		setMaxPoolSize ( minAndMaxSize );
 	}
+
+	/**
+	 * Resizes the pool at runtime by updating both the minimum and maximum pool
+	 * size and immediately triggering pool maintenance. This is the preferred way
+	 * to change pool sizes after initialization, keeping resizing logic in the
+	 * datasource implementation and relying on the pool's getter-based design to
+	 * pick up the new values.
+	 *
+	 * @param minPoolSize The new minimum pool size. Must be at least 0 and at most maxPoolSize.
+	 * @param maxPoolSize The new maximum pool size. Must be greater than 0.
+	 * @throws AtomikosJMSException if the supplied values are invalid.
+	 */
+	public synchronized void resizePool(int minPoolSize, int maxPoolSize) throws AtomikosJMSException {
+		if (maxPoolSize < 1)
+			throwAtomikosJMSException("Property 'maxPoolSize' must be greater than 0, was: " + maxPoolSize);
+		if (minPoolSize < 0 || minPoolSize > maxPoolSize)
+			throwAtomikosJMSException("Property 'minPoolSize' must be at least 0 and at most maxPoolSize (" + maxPoolSize + "), was: " + minPoolSize);
+		this.minPoolSize = minPoolSize;
+		this.maxPoolSize = maxPoolSize;
+		if (connectionPool != null) {
+			connectionPool.performMaintenance();
+		}
+	}
 	
 	/**
 	 * Gets the unique name for this resource. 
