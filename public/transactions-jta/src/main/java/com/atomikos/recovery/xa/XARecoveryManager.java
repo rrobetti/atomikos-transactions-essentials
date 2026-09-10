@@ -38,12 +38,18 @@ private static final Logger LOGGER = LoggerFactory.createLogger(XARecoveryManage
 	private XidSelector xidSelector;
 	private String tmUniqueName;
 	private long maxTimeout;
+	private RecoveryDecisionArbiter recoveryDecisionArbiter;
 
 	private Map<String,PreviousXidRepository> previousXidRepositoryMap = new HashMap<String, PreviousXidRepository>();
 	
 	
 	public XARecoveryManager(final String tmUniqueName) {
+		this(tmUniqueName, RecoveryDecisionStoreFactory.create());
+	}
+
+	XARecoveryManager(final String tmUniqueName, RecoveryDecisionStore recoveryDecisionStore) {
 		this.tmUniqueName = tmUniqueName;
+		this.recoveryDecisionArbiter = new RecoveryDecisionArbiter(recoveryDecisionStore);
 		this.xidSelector=new XidSelector() {
 			@Override
 			public boolean selects(XID xid) {
@@ -111,7 +117,7 @@ private static final Logger LOGGER = LoggerFactory.createLogger(XARecoveryManage
 	}
 
 
-	private boolean recoverXids(List<XID> xidsToRecover, PreviousXidRepository previousXidRepository,
+	boolean recoverXids(List<XID> xidsToRecover, PreviousXidRepository previousXidRepository,
 			Collection<PendingTransactionRecord> expiredCommittingCoordinators, Collection<PendingTransactionRecord> indoubtForeignCoordinatorsToKeep, XAResource xaResource,
 			long startOfRecoveryScan) {
 		boolean allExpiredCommitsDone = true;
@@ -122,21 +128,39 @@ private static final Logger LOGGER = LoggerFactory.createLogger(XARecoveryManage
 		for (XID xid : xidsToRecover) {
 			String coordinatorId = xid.getGlobalTransactionIdAsString();
 			if (expiredCommittingCoordinatorIds.contains(coordinatorId)) {
-				boolean replayCommitOK = replayCommit(xid, xaResource);
-				if (!replayCommitOK) {
-					previousXidRepository.remember(xid, startOfRecoveryScan + 1); // cf case 185455: so hasPendingXids returns true
-					allExpiredCommitsDone = false;
-				}
+				allExpiredCommitsDone = recoverBranch(xid, coordinatorId, RecoveryDecision.COMMIT, xaResource, previousXidRepository, startOfRecoveryScan, allExpiredCommitsDone);
 			} else if (expiredPreviousXids.contains(xid)) {
-			    if (foreignIndoubtCoordinatorIds.contains(coordinatorId) || !presumedAbort(xid, xaResource)) {
+			    if (foreignIndoubtCoordinatorIds.contains(coordinatorId)) {
 			        //foreign indoubt, or presumed abort failed (probably hazard) => try again later next scan (ASAP)
 			        previousXidRepository.remember(xid, startOfRecoveryScan + 1); 
+			    } else {
+			    	allExpiredCommitsDone = recoverBranch(xid, coordinatorId, RecoveryDecision.ABORT, xaResource, previousXidRepository, startOfRecoveryScan, allExpiredCommitsDone);
 			    }
 			} else {
 				previousXidRepository.remember(xid, xidDetectionTime + maxTimeout); // unknown xid => wait for maxTimeout
 			}
 		}
 		return allExpiredCommitsDone;
+	}
+
+	private boolean recoverBranch(XID xid, String coordinatorId, RecoveryDecision proposedDecision, XAResource xaResource,
+			PreviousXidRepository previousXidRepository, long startOfRecoveryScan, boolean allExpiredCommitsDone) {
+		RecoveryDecision authoritativeDecision = recoveryDecisionArbiter.decide(coordinatorId, proposedDecision);
+		boolean recoveryDone = applyAuthoritativeRecoveryDecision(xid, authoritativeDecision, xaResource);
+		if (!recoveryDone) {
+			previousXidRepository.remember(xid, startOfRecoveryScan + 1); // cf case 185455: so hasPendingXids returns true
+			if (authoritativeDecision == RecoveryDecision.COMMIT) {
+				allExpiredCommitsDone = false;
+			}
+		}
+		return allExpiredCommitsDone;
+	}
+
+	private boolean applyAuthoritativeRecoveryDecision(XID xid, RecoveryDecision authoritativeDecision, XAResource xaResource) {
+		if (authoritativeDecision == RecoveryDecision.COMMIT) {
+			return replayCommit(xid, xaResource);
+		}
+		return presumedAbort(xid, xaResource);
 	}
 	
 	private boolean replayCommit(XID xid, XAResource xaResource) {
